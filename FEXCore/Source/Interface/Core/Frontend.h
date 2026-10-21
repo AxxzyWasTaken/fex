@@ -158,6 +158,9 @@ private:
   uint64_t ExecutableRangeBase {};
   uint64_t ExecutableRangeEnd {};
   bool ExecutableRangeWritable {};
+  bool ExecutableRangeNeedsInlineSMCChecks {};
+  // Set when any byte of the current instruction came from a range that needs inline SMC checks
+  bool HitInlineSMCCheckRange {};
   bool HitNonExecutableRange {};
   bool HitBadRelocation {};
   uint32_t HitBreakpoint {~0U};
