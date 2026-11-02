@@ -68,6 +68,11 @@ function(AddTests Tests BinDirectory Bitness)
       set_property(TEST "${TEST_CASE}.jit.flt" APPEND PROPERTY ENVIRONMENT "FEX_HOSTFEATURES=disablerng;FEX_SOFTWARERNG=1")
     endif()
 
+    if(TEST_NAME STREQUAL "call_padding")
+      # The test reads FEX's compile count
+      set_property(TEST "${TEST_CASE}.jit.flt" APPEND PROPERTY ENVIRONMENT "FEX_PROFILESTATS=1")
+    endif()
+
     if(TEST_NAME STREQUAL "vulkan_procaddr")
       set_property(TEST "${TEST_CASE}.jit.flt" APPEND PROPERTY ENVIRONMENT
         "FEX_THUNKCONFIG=${CMAKE_SOURCE_DIR}/Data/CI/VulkanThunks.json;FEX_THUNKHOSTLIBS=${HOSTLIBS_DATA_DIRECTORY}/HostThunks;FEX_THUNKGUESTLIBS=${CMAKE_INSTALL_PREFIX}/share/fex-emu/GuestThunks")

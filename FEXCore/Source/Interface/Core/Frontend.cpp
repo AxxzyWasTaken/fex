@@ -1145,6 +1145,18 @@ void Decoder::BranchTargetInMultiblockRange() {
       return;
     }
 
+    // Compilers pad after a call that doesn't return, because the next function starts there. A third of the functions in optimised
+    // C++ end this way (_Unwind_Resume, __assert_fail, __stack_chk_fail). Going on would translate the next function, and from there
+    // the one after it, up to MaxInst. Getting this wrong for a call that does return only costs a compile when it returns.
+    uint8_t PrefixBytes = 0;
+    auto NextByte = PeekByte(PrefixBytes);
+    while ((NextByte == 0x66 || NextByte == 0x2E) && PrefixBytes < MAX_INST_SIZE) {
+      NextByte = PeekByte(++PrefixBytes);
+    }
+    if (NextByte == 0xCC || NextByte == 0x90 || (NextByte == 0x0F && PeekByte(PrefixBytes + 1) == 0x1F)) {
+      return;
+    }
+
     AddBranchTarget(InstEnd);
     BlockInfo.EntryPoints.emplace(InstEnd);
     return;
