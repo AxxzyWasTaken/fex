@@ -120,9 +120,14 @@ struct HostFeatures {
   uint32_t SupportsAFP                 : 1 {}; // [32]
   uint32_t SupportsFloatExceptions     : 1 {}; // [33]
   uint32_t SupportsBF16                : 1 {}; // [34]
+  // Apple's x86 parity/adjust flag extension (APFLG, Apple cores under an
+  // Aurora kernel): flag-setting instructions also compute x86 PF and AF into
+  // NZCV bits 26 and 27, and FEX keeps PF/AF there instead of in REG_PF/REG_AF.
+  // Independent of SupportsAFP: a core with FEAT_AFP uses both.
+  uint32_t SupportsAPFLG : 1 {}; // [35]
   // Flag if this is InstCountCI
-  uint32_t IsInstCountCI : 1 {};  // [38]
-  uint32_t pad           : 28 {}; // [63:35]
+  uint32_t IsInstCountCI : 1 {};  // [36]
+  uint32_t pad           : 27 {}; // [63:37]
 
   // This affects codegen, but it isn't machine state
   ProcessFeaturesHash ProcessFeatures {};
