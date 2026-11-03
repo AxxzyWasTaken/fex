@@ -20,6 +20,7 @@
 #include <FEXCore/fextl/unordered_map.h>
 #include <FEXCore/fextl/vector.h>
 
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -379,6 +380,8 @@ public:
   bool HostRNGAvailable {};
 
   FEXCore::Utils::WritePriorityMutex::Mutex CodeInvalidationMutex {};
+  // Taken while compiling a guest entry, by hash of its RIP. See CompileBlockLocked.
+  std::array<FEXCore::Utils::WritePriorityMutex::Mutex, 1024> EntryCompileLocks {};
 
   uint32_t StrictSplitLockMutex {};
 
