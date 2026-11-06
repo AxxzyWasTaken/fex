@@ -6,6 +6,15 @@
 
 constexpr auto SleepAmount = std::chrono::milliseconds(250);
 
+// The timed waits count CNTVCT_EL0 ticks, which NTP never adjusts. The test
+// measures them with high_resolution_clock (the system clock in libstdc++),
+// which the kernel runs up to 500 ppm fast or slow while NTP corrects its
+// frequency (MAXFREQ in the kernel's timekeeping). Allow for that much, or a
+// host whose clock is being slewed sees an exact 250 ms wait come back a few
+// microseconds short.
+constexpr auto MinimumTimedWait =
+  std::chrono::nanoseconds(SleepAmount) - std::chrono::nanoseconds(SleepAmount) / 2000;
+
 TEST_CASE("FutexSpin-Timed-8bit") {
   uint8_t Test {};
 
@@ -15,7 +24,7 @@ TEST_CASE("FutexSpin-Timed-8bit") {
   auto diff = end - now;
 
   // The futex spinwait needs to have slept for at /least/ the amount specified. It will always run slightly late.
-  REQUIRE(std::chrono::duration_cast<std::chrono::nanoseconds>(diff) >= std::chrono::duration_cast<std::chrono::nanoseconds>(SleepAmount));
+  REQUIRE(std::chrono::duration_cast<std::chrono::nanoseconds>(diff) >= MinimumTimedWait);
 }
 
 TEST_CASE("FutexSpin-Sleep-8bit") {
@@ -59,7 +68,7 @@ TEST_CASE("FutexSpin-Timed-16bit") {
   auto diff = end - now;
 
   // The futex spinwait needs to have slept for at /least/ the amount specified. It will always run slightly late.
-  REQUIRE(std::chrono::duration_cast<std::chrono::nanoseconds>(diff) >= std::chrono::duration_cast<std::chrono::nanoseconds>(SleepAmount));
+  REQUIRE(std::chrono::duration_cast<std::chrono::nanoseconds>(diff) >= MinimumTimedWait);
 }
 
 TEST_CASE("FutexSpin-Timed-32bit") {
@@ -71,7 +80,7 @@ TEST_CASE("FutexSpin-Timed-32bit") {
   auto diff = end - now;
 
   // The futex spinwait needs to have slept for at /least/ the amount specified. It will always run slightly late.
-  REQUIRE(std::chrono::duration_cast<std::chrono::nanoseconds>(diff) >= std::chrono::duration_cast<std::chrono::nanoseconds>(SleepAmount));
+  REQUIRE(std::chrono::duration_cast<std::chrono::nanoseconds>(diff) >= MinimumTimedWait);
 }
 
 TEST_CASE("FutexSpin-Timed-64bit") {
@@ -83,5 +92,5 @@ TEST_CASE("FutexSpin-Timed-64bit") {
   auto diff = end - now;
 
   // The futex spinwait needs to have slept for at /least/ the amount specified. It will always run slightly late.
-  REQUIRE(std::chrono::duration_cast<std::chrono::nanoseconds>(diff) >= std::chrono::duration_cast<std::chrono::nanoseconds>(SleepAmount));
+  REQUIRE(std::chrono::duration_cast<std::chrono::nanoseconds>(diff) >= MinimumTimedWait);
 }
