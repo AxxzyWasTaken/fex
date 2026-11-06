@@ -148,6 +148,7 @@ public:
   void StartNewBlock() {
     // If we loaded flags but didn't change them, invalidate the cached copy and move on.
     // Changes get stored out by CalculateDeferredFlags.
+    DropLazyPFAF();
     CachedNZCV = nullptr;
     CFInverted = CFInvertedABI;
 
@@ -207,9 +208,12 @@ public:
     FlushRegisterCache();
     return _ExitFunction(GetOpSize(NewRIP), NewRIP, Hint, CallReturnAddress, CallReturnBlock, PatchSiteAddress, PatchSiteSize);
   }
-  IRPair<IROp_Break> Break(BreakDefinition Reason) {
+  IRPair<IROp_Break> Break(BreakDefinition Reason, Ref RelocatedPC = nullptr) {
     FlushRegisterCache();
-    return _Break(Reason);
+    if (!RelocatedPC) {
+      RelocatedPC = Constant(0);
+    }
+    return _Break(Reason, RelocatedPC);
   }
   IRPair<IROp_Thunk> Thunk(Ref ArgPtr, SHA256Sum ThunkNameHash) {
     FlushRegisterCache();
@@ -217,6 +221,8 @@ public:
   }
 
   bool FinishOp(uint64_t NextRIP, bool LastOp) {
+    ++RegCache.Index;
+
     // If we are switching to a new block and this current block has yet to set a RIP
     // Then we need to insert an unconditional jump from the current block to the one we are going to
     // This happens most frequently when an instruction jumps backwards to another location
@@ -488,6 +494,7 @@ public:
   void SGDTOp(OpcodeArgs);
   void SIDTOp(OpcodeArgs);
   void SMSWOp(OpcodeArgs);
+  void SLDTOp(OpcodeArgs);
 
   enum class VectorOpType {
     MMX,
@@ -755,6 +762,7 @@ public:
   void X87LDENV(OpcodeArgs);
   void X87ModifySTP(OpcodeArgs, bool Inc);
   void X87OpHelper(OpcodeArgs, FEXCore::IR::IROps IROp, bool ZeroC2);
+  void X87NOP(OpcodeArgs);
 
   enum class FCOMIFlags {
     FLAGS_X87,
@@ -828,6 +836,7 @@ public:
   void LoadFenceOrXRSTOR(OpcodeArgs);
   void MemFenceOrXSAVEOPT(OpcodeArgs);
   void StoreFenceOrCLFlush(OpcodeArgs);
+  void SerializeOp(OpcodeArgs);
   void UMonitorOrCLRSSBSY(OpcodeArgs);
   void UMWaitOp(OpcodeArgs);
   void CLZeroOp(OpcodeArgs);
@@ -894,7 +903,8 @@ public:
   void Extrq(OpcodeArgs);
   void Insertq(OpcodeArgs);
 
-  void BreakOp(OpcodeArgs, FEXCore::IR::BreakDefinition BreakDefinition);
+  void BreakOp(OpcodeArgs, FEXCore::IR::BreakDefinition BreakDefinition, Ref RelocatedPC = nullptr);
+  void BreakpointOp(OpcodeArgs, uint32_t BP);
   void UnimplementedOp(OpcodeArgs);
   void PermissionRestrictedOp(OpcodeArgs);
 
@@ -1092,6 +1102,11 @@ public:
 
   void AVX128_VCVTPH2PS(OpcodeArgs);
   void AVX128_VCVTPS2PH(OpcodeArgs);
+  void AVX128_VBCSTNEBF162PS(OpcodeArgs);
+  void AVX128_VBCSTNESH2PS(OpcodeArgs);
+  void AVX128_VCVTNEEBF162PS(OpcodeArgs, bool Even);
+  void AVX128_VCVTNEEPH2PS(OpcodeArgs, bool Even);
+  void AVX128_VCVTNEPS2BF16(OpcodeArgs);
 
   // End of AVX 128-bit implementation
 
@@ -1126,10 +1141,16 @@ public:
   void AVXVectorUnaryOp(OpcodeArgs, IROps IROp, IR::OpSize ElementSize);
   void AVXVectorVariableBlend(OpcodeArgs, IR::OpSize ElementSize);
 
+  void AVXVBCSTNEBF162PS(OpcodeArgs);
+  void AVXVBCSTNESH2PS(OpcodeArgs);
+  void AVXVCVTNEEBF162PS(OpcodeArgs, bool Even);
+  void AVXVCVTNEEPH2PS(OpcodeArgs, bool Even);
+  void AVXVCVTNEPS2BF16(OpcodeArgs);
+
   // End of AVX 256-bit implementation
 
   void InvalidOp(OpcodeArgs);
-  void NoExecOp(OpcodeArgs);
+  void NoExecOrPartialOp(OpcodeArgs);
 
   void SetPackedRFLAG(bool Lower8, Ref Src);
   Ref GetPackedRFLAG(uint32_t FlagsMask = ~0U);
@@ -1137,6 +1158,11 @@ public:
   void SetMultiblock(bool _Multiblock) {
     Multiblock = _Multiblock;
   }
+
+  // Apple APFLG: with the extension on, x86 PF and AF live in host NZCV bits
+  // 26 and 27 (as true values) instead of in the deferred raw registers.
+  static constexpr unsigned APFLG_PF_BIT = 26;
+  static constexpr unsigned APFLG_AF_BIT = 27;
 
   static inline constexpr unsigned IndexNZCV(unsigned BitOffset) {
     switch (BitOffset) {
@@ -1175,19 +1201,30 @@ public:
     _StoreContext(Size, Class, Value, Offset);
   }
 
-  void FlushRegisterCache(bool SRAOnly = false, bool MMXOnly = false) {
+  // KeepLazyPFAF: see CalculateDeferredFlags.
+  void FlushRegisterCache(bool SRAOnly = false, bool MMXOnly = false, bool KeepLazyPFAF = false) {
     // At block boundaries, fix up the carry flag.
     if (!SRAOnly) {
       RectifyCarryInvert(CFInvertedABI);
 
-      // Also we can't trust the LastDef accross block boundaries, so clear that as well.
+      // Also we can't trust the LastDef or PrevDef arrays accross block boundaries, so clear them as well.
       for (auto& Def : RegCache.LastDef) {
         Def = nullptr;
       }
+      for (auto& Def : RegCache.PrevDef) {
+        Def = nullptr;
+      }
+      for (auto& DefIndex : RegCache.LastDefIndex) {
+        DefIndex = 0;
+      }
+      for (auto& DefIndex : RegCache.PrevDefIndex) {
+        DefIndex = 0;
+      }
+      RegCache.Index = 0;
     }
 
     if (!MMXOnly) {
-      CalculateDeferredFlags();
+      CalculateDeferredFlags(KeepLazyPFAF);
     }
 
     const auto GPRSize = GetGPROpSize();
@@ -1321,6 +1358,7 @@ protected:
 
 private:
   FEX_CONFIG_OPT(ReducedPrecisionMode, X87REDUCEDPRECISION);
+  FEX_CONFIG_OPT(UndefinedFlagAcidTest, UNDEFINEDFLAGACIDTEST);
 
   struct JumpTargetInfo {
     Ref BlockEntry;
@@ -1503,7 +1541,7 @@ private:
   void SaveAVXState(Ref MemBase);
 
   void XRstorOpImpl(OpcodeArgs);
-  void RestoreX87State(Ref MemBase);
+  void RestoreX87State(OpcodeArgs, Ref MemBase);
   void RestoreSSEState(Ref MemBase);
   void RestoreMXCSRState(Ref MXCSR);
   void RestoreAVXState(Ref MemBase);
@@ -1682,6 +1720,7 @@ private:
 
   // Set flag tracking to prepare for an operation that directly writes NZCV.
   void HandleNZCVWrite() {
+    DropLazyPFAF();
     CachedNZCV = nullptr;
     NZCVDirty = false;
   }
@@ -1711,17 +1750,94 @@ private:
       CachedNZCV = _LoadNZCV();
     }
 
+    if (LazyPFDirty || LazyAFDirty) {
+      // Whole NZCV wanted: put the pending PF/AF in the cached copy, which is
+      // stored as usual. They stay known for later readers.
+      Ref NZCV = CachedNZCV;
+      if (LazyPFDirty) {
+        NZCV = _Bfi(OpSize::i32Bit, 1, APFLG_PF_BIT, NZCV, LazyPF);
+      }
+      if (LazyAFDirty) {
+        NZCV = _Bfi(OpSize::i32Bit, 1, APFLG_AF_BIT, NZCV, LazyAF);
+      }
+      LazyPFDirty = false;
+      LazyAFDirty = false;
+      CachedNZCV = NZCV;
+      NZCVDirty = true;
+    }
+
     return CachedNZCV;
   }
 
   void SetNZCV(Ref Value) {
+    DropLazyPFAF();
     CachedNZCV = Value;
     NZCVDirty = true;
   }
 
   void ZeroNZCV() {
+    DropLazyPFAF();
     CachedNZCV = Constant(0);
     NZCVDirty = true;
+  }
+
+  bool APFLG() const {
+    return CTX->HostFeatures.SupportsAPFLG;
+  }
+
+  // APFLG: operands of the pending AF, consumed by the next CalculatePF.
+  struct {
+    Ref Src1, Src2;
+  } PendingAF {};
+
+  // APFLG: known 0/1 values of PF/AF, used by readers instead of NZCV. A
+  // dirty one is not in NZCV yet: flushes store it with StoreAPFLG, which the
+  // dead-flag pass drops when a later flag write overwrites it.
+  Ref LazyPF {};
+  Ref LazyAF {};
+  // !LazyPF when the producer has it for free, else nullptr.
+  Ref LazyPFInv {};
+  bool LazyPFDirty {};
+  bool LazyAFDirty {};
+
+  void DropLazyPFAF() {
+    LazyPF = nullptr;
+    LazyAF = nullptr;
+    LazyPFInv = nullptr;
+    LazyPFDirty = false;
+    LazyAFDirty = false;
+  }
+
+  // APFLG: set 0/1 values of PF and/or AF (nullptr keeps the flag).
+  void SetAPFLGBits(Ref PF, Ref AF, Ref PFInv = nullptr) {
+    if (PF) {
+      LazyPF = PF;
+      LazyPFInv = PFInv;
+      LazyPFDirty = true;
+    }
+    if (AF) {
+      LazyAF = AF;
+      LazyAFDirty = true;
+    }
+  }
+
+  // Put dirty PF/AF into host NZCV; the host copy of NZCV is current.
+  void StoreLazyPFAF() {
+    if (LazyPFDirty || LazyAFDirty) {
+      _StoreAPFLG(LazyPFDirty ? LazyPF : Invalid(), LazyAFDirty ? LazyAF : Invalid(), (LazyPFDirty ? 1 : 0) | (LazyAFDirty ? 2 : 0));
+      LazyPFDirty = false;
+      LazyAFDirty = false;
+    }
+  }
+
+  Ref GetAPFLGBit(unsigned Bit) {
+    if (Bit == APFLG_PF_BIT && LazyPF) {
+      return LazyPF;
+    }
+    if (Bit == APFLG_AF_BIT && LazyAF) {
+      return LazyAF;
+    }
+    return _Bfe(OpSize::i32Bit, 1, Bit, GetNZCV());
   }
 
   void SetNZ_ZeroCV(IR::OpSize SrcSize, Ref Res, bool SetPF = false) {
@@ -1733,7 +1849,7 @@ private:
     // This is currently worse for 8/16-bit, but that should be optimized. TODO
     if (SrcSize >= OpSize::i32Bit) {
       if (SetPF) {
-        CalculatePF(SubWithFlags(SrcSize, Res, (uint64_t)0));
+        CalculatePFAFFromHost(SubWithFlags(SrcSize, Res, (uint64_t)0));
       } else {
         _SubNZCV(SrcSize, Res, Constant(0));
       }
@@ -1744,7 +1860,7 @@ private:
       CFInverted = false;
 
       if (SetPF) {
-        CalculatePF(Res);
+        CalculatePFAFFromHost(Res);
       }
     }
   }
@@ -1864,8 +1980,10 @@ private:
     }
 
     if (BitOffset == FEXCore::X86State::RFLAG_PF_RAW_LOC) {
+      LOGMAN_THROW_A_FMT(!APFLG(), "raw PF write with APFLG");
       StoreRegister(Core::CPUState::PF_AS_GREG, false, Value);
     } else if (BitOffset == FEXCore::X86State::RFLAG_AF_RAW_LOC) {
+      LOGMAN_THROW_A_FMT(!APFLG(), "raw AF write with APFLG");
       StoreRegister(Core::CPUState::AF_AS_GREG, false, Value);
     } else if (BitOffset == FEXCore::X86State::RFLAG_DF_RAW_LOC) {
       // For DF, we need to transform 0/1 into 1/-1
@@ -1884,6 +2002,11 @@ private:
   }
 
   void SetAF(unsigned K) {
+    if (APFLG()) {
+      SetAPFLGBits(nullptr, Constant(K));
+      return;
+    }
+
     // AF is stored in bit 4 of the AF flag byte, with garbage in the other
     // bits. This allows us to defer the extract in the usual case. When it is
     // read, bit 4 is extracted.  In order to write a constant value of AF, that
@@ -1894,14 +2017,71 @@ private:
   void ZeroPF_AF();
 
   void InvalidateAF() {
+    LazyAF = nullptr;
+    LazyAFDirty = false;
     _InvalidateFlags((1u << X86State::RFLAG_AF_RAW_LOC));
     InvalidateReg(Core::CPUState::AF_AS_GREG);
   }
 
   void InvalidatePF_AF() {
+    DropLazyPFAF();
     _InvalidateFlags((1u << X86State::RFLAG_PF_RAW_LOC) | (1u << X86State::RFLAG_AF_RAW_LOC));
     InvalidateReg(Core::CPUState::PF_AS_GREG);
     InvalidateReg(Core::CPUState::AF_AS_GREG);
+  }
+
+  // Sets the desired flags to zero when acid test is enabled.
+  // Not meant to be fast, just meant to produce consistent results.
+  void AcidTestFlags(unsigned BitOffset = 0, unsigned BitOffset2 = 0, unsigned BitOffset3 = 0, unsigned BitOffset4 = 0,
+                     unsigned BitOffset5 = 0, unsigned BitOffset6 = 0) {
+    if (!UndefinedFlagAcidTest) [[likely]] {
+      return;
+    }
+
+    unsigned BitFlags {};
+    if (BitOffset) {
+      BitFlags |= 1U << BitOffset;
+    }
+    if (BitOffset2) {
+      BitFlags |= 1U << BitOffset2;
+    }
+    if (BitOffset3) {
+      BitFlags |= 1U << BitOffset3;
+    }
+    if (BitOffset4) {
+      BitFlags |= 1U << BitOffset4;
+    }
+    if (BitOffset5) {
+      BitFlags |= 1U << BitOffset5;
+    }
+    if (BitOffset6) {
+      BitFlags |= 1U << BitOffset6;
+    }
+
+    auto Flag = Constant(0);
+    if (APFLG() && (BitFlags & (1U << X86State::RFLAG_AF_RAW_LOC))) {
+      // APFLG keeps AF in NZCV.
+      SetAPFLGBits(nullptr, Flag);
+      BitFlags &= ~(1U << X86State::RFLAG_AF_RAW_LOC);
+    }
+    if (BitFlags & (1U << X86State::RFLAG_SF_RAW_LOC)) {
+      SetRFLAG(Flag, FEXCore::X86State::RFLAG_SF_RAW_LOC);
+    }
+    if (BitFlags & (1U << X86State::RFLAG_ZF_RAW_LOC)) {
+      SetRFLAG(Flag, FEXCore::X86State::RFLAG_ZF_RAW_LOC);
+    }
+    if (BitFlags & (1U << X86State::RFLAG_CF_RAW_LOC)) {
+      SetRFLAG(Flag, FEXCore::X86State::RFLAG_CF_RAW_LOC);
+    }
+    if (BitFlags & (1U << X86State::RFLAG_OF_RAW_LOC)) {
+      SetRFLAG(Flag, FEXCore::X86State::RFLAG_OF_RAW_LOC);
+    }
+    if (BitFlags & (1U << X86State::RFLAG_AF_RAW_LOC)) {
+      SetRFLAG(Flag, FEXCore::X86State::RFLAG_AF_RAW_LOC);
+    }
+    if (BitFlags & (1U << X86State::RFLAG_AF_RAW_LOC)) {
+      SetRFLAG(Flag, FEXCore::X86State::RFLAG_AF_RAW_LOC);
+    }
   }
 
   [[nodiscard]]
@@ -1971,8 +2151,16 @@ private:
     Ref Value[64];
 
     // Keep track of where each register was last written to within the current block,
-    // for use in peephole optimizations.
+    // for use in peephole optimizations. LastDefIndex is a parallel structure,
+    // which tracks the index of each Op in LastDef.
     Ref LastDef[64];
+    uint32_t LastDefIndex[64];
+    // Similar to LastDef, but tracks the write before LastDef. Think of it as LastDef^2.
+    Ref PrevDef[64];
+    uint32_t PrevDefIndex[64];
+
+    // The index of the current instruction in the current block.
+    uint32_t Index;
   } RegCache {};
 
   void InvalidateReg(uint8_t Index) {
@@ -2095,7 +2283,10 @@ private:
     RegCache.Value[Index] = Value;
     RegCache.Cached |= Bit;
     RegCache.Written |= Bit;
+    RegCache.PrevDef[Index] = RegCache.LastDef[Index];
+    RegCache.PrevDefIndex[Index] = RegCache.LastDefIndex[Index];
     RegCache.LastDef[Index] = Value;
+    RegCache.LastDefIndex[Index] = RegCache.Index;
   }
 
   void InvalidateHighAVXRegisters() {
@@ -2134,8 +2325,10 @@ private:
         return _NZCVSelect01(CondForNZCVBit(BitOffset, Invert));
       }
     } else if (BitOffset == FEXCore::X86State::RFLAG_PF_RAW_LOC) {
+      LOGMAN_THROW_A_FMT(!APFLG(), "raw PF read with APFLG");
       return LoadGPR(Core::CPUState::PF_AS_GREG);
     } else if (BitOffset == FEXCore::X86State::RFLAG_AF_RAW_LOC) {
+      LOGMAN_THROW_A_FMT(!APFLG(), "raw AF read with APFLG");
       return LoadGPR(Core::CPUState::AF_AS_GREG);
     } else if (BitOffset == FEXCore::X86State::RFLAG_DF_RAW_LOC) {
       // Recover the sign bit, it is the logical DF value
@@ -2205,10 +2398,18 @@ private:
     // We set PF to unordered (V), but our PF representation is inverted so we
     // actually set to !V. This is one instruction with the VC cond code.
     Ref V_inv = GetRFLAG(FEXCore::X86State::RFLAG_OF_RAW_LOC, true);
+    if (APFLG()) {
+      // PF = unordered (V) and AF = 0 go into NZCV after AXFLAG below, which
+      // clobbers them.
+      Ref Unordered = GetRFLAG(FEXCore::X86State::RFLAG_OF_RAW_LOC);
+      _AXFlag(CTX->HostFeatures.SupportsFlagM2 ? Invalid() : V_inv);
+      CFInverted = true;
+      SetAPFLGBits(Unordered, Constant(0), V_inv);
+      return;
+    }
     SetRFLAG<FEXCore::X86State::RFLAG_PF_RAW_LOC>(V_inv);
 
-    // Intel: OF, SF, and AF set to zero
-    // AMD:   no mention of OF, SF and AF but actual hardware seems to always zero
+    // Both Intel and AMD manual state that OF, SF, and AF are set to zero.
     //
     // Zero AF. Note that the comparison sets the raw PF to 0/1 above, so
     // PF[4] is 0 so the XOR with PF will have no effect, so setting the AF
@@ -2256,6 +2457,14 @@ private:
   // Helper to store a variable shift and calculate its flags for a variable
   // shift, with correct PF handling.
   void HandleShift(X86Tables::DecodedOp Op, Ref Result, Ref Dest, ShiftType Shift, Ref Src) {
+    if (APFLG()) {
+      // The lowering leaves PF (and AF = 0) in NZCV, or keeps both for a zero
+      // shift. Its GPR result is unused.
+      HandleNZCV_RMW();
+      _ShiftFlags(OpSizeFromSrc(Op), Result, Dest, Shift, Src, Constant(0), CFInverted);
+      StoreResultGPR(Op, Result);
+      return;
+    }
 
     auto OldPF = GetRFLAG(X86State::RFLAG_PF_RAW_LOC);
 
@@ -2340,7 +2549,9 @@ private:
   /**
    * @brief Flushes NZCV. Mostly vestigial.
    */
-  void CalculateDeferredFlags();
+  // KeepLazyPFAF: the caller only needs host N/Z/C/V, so pending APFLG PF/AF
+  // may stay out of NZCV.
+  void CalculateDeferredFlags(bool KeepLazyPFAF = false);
 
   void ZeroShiftResult(FEXCore::X86Tables::DecodedOp Op) {
     // In the case of zero-rotate, we need to store the destination still to deal with 32-bit semantics.
@@ -2415,6 +2626,9 @@ private:
   void SetAFAndFixup(Ref AF);
   Ref CalculateAFForDecimal(Ref A);
   void CalculatePF(Ref Res);
+  // PF/AF of Res were just computed by the host flag operation that produced
+  // it (APFLG); otherwise the same as CalculatePF.
+  void CalculatePFAFFromHost(Ref Res);
   void CalculateAF(Ref Src1, Ref Src2);
 
   Ref IncrementByCarry(OpSize OpSize, Ref Src);
@@ -2439,6 +2653,12 @@ private:
   void SetX87FTW(Ref FTW);
   Ref GetX87FTW_Helper();
   void SetX87Top(Ref Value);
+  void StoreX87FIP(FEXCore::X86Tables::DecodedOp Op) {
+    if (CTX->Config.JITFeatures & FEXCore::Config::JITFeatures::ENABLEX87FIP) {
+      // Only store FIP if the feature is enabled.
+      _StoreContextGPR(OpSize::i64Bit, GetRelocatedPC(Op, -Op->InstSize), offsetof(FEXCore::Core::CPUState, FIP));
+    }
+  }
 
   void ChgStateX87_MMX() override {
     LOGMAN_THROW_A_FMT(MMXState == MMXState_X87, "Expected state to be x87");

@@ -242,15 +242,23 @@ uint32_t ContextImpl::ReconstructCompactedEFLAGS(FEXCore::Core::InternalThreadSt
   EFLAGS |= ZF << X86State::RFLAG_ZF_RAW_LOC;
   EFLAGS |= SF << X86State::RFLAG_SF_RAW_LOC;
 
-  // PF calculation is deferred, calculate it now.
-  // Popcount the 8-bit flag and then extract the lower bit.
-  uint32_t PFByte = Frame->State.pf_raw & 0xff;
-  uint32_t PF = std::popcount(PFByte ^ 1) & 1;
-  EFLAGS |= PF << X86State::RFLAG_PF_RAW_LOC;
+  uint32_t PF, AF;
+  if (HostFeatures.SupportsAPFLG) {
+    // Apple APFLG: PF and AF are in NZCV bits 26 and 27, which the kernel also
+    // reports in PSTATE.
+    PF = (Packed_NZCV >> IR::OpDispatchBuilder::APFLG_PF_BIT) & 1;
+    AF = (Packed_NZCV >> IR::OpDispatchBuilder::APFLG_AF_BIT) & 1;
+  } else {
+    // PF calculation is deferred, calculate it now.
+    // Popcount the 8-bit flag and then extract the lower bit.
+    uint32_t PFByte = Frame->State.pf_raw & 0xff;
+    PF = std::popcount(PFByte ^ 1) & 1;
 
-  // AF calculation is deferred, calculate it now.
-  // XOR with PF byte and extract bit 4.
-  uint32_t AF = ((Frame->State.af_raw ^ PFByte) & (1 << 4)) ? 1 : 0;
+    // AF calculation is deferred, calculate it now.
+    // XOR with PF byte and extract bit 4.
+    AF = ((Frame->State.af_raw ^ PFByte) & (1 << 4)) ? 1 : 0;
+  }
+  EFLAGS |= PF << X86State::RFLAG_PF_RAW_LOC;
   EFLAGS |= AF << X86State::RFLAG_AF_RAW_LOC;
 
   uint8_t TFByte = Frame->State.flags[X86State::RFLAG_TF_RAW_LOC];
@@ -348,6 +356,11 @@ void ContextImpl::SetFlagsFromCompactedEFLAGS(FEXCore::Core::InternalThreadState
   Packed_NZCV |= (EFLAGS & (1U << X86State::RFLAG_CF_RAW_LOC)) ? 0 : 1U << IR::OpDispatchBuilder::IndexNZCV(X86State::RFLAG_CF_RAW_LOC);
   Packed_NZCV |= (EFLAGS & (1U << X86State::RFLAG_ZF_RAW_LOC)) ? 1U << IR::OpDispatchBuilder::IndexNZCV(X86State::RFLAG_ZF_RAW_LOC) : 0;
   Packed_NZCV |= (EFLAGS & (1U << X86State::RFLAG_SF_RAW_LOC)) ? 1U << IR::OpDispatchBuilder::IndexNZCV(X86State::RFLAG_SF_RAW_LOC) : 0;
+  if (HostFeatures.SupportsAPFLG) {
+    // Apple APFLG: PF and AF live in NZCV bits 26 and 27.
+    Packed_NZCV |= (EFLAGS & (1U << X86State::RFLAG_PF_RAW_LOC)) ? 1U << IR::OpDispatchBuilder::APFLG_PF_BIT : 0;
+    Packed_NZCV |= (EFLAGS & (1U << X86State::RFLAG_AF_RAW_LOC)) ? 1U << IR::OpDispatchBuilder::APFLG_AF_BIT : 0;
+  }
   memcpy(&Frame->State.flags[X86State::RFLAG_NZCV_LOC], &Packed_NZCV, sizeof(Packed_NZCV));
 
   // Reserved, Read-As-1, Write-as-1
@@ -657,9 +670,12 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
         // It is potentially correctness bearing in that sense, but that is a
         // side effect here and (if that behaviour is required) we should handle
         // that more explicitly later.
-        Thread->OpDispatcher->FlushRegisterCache(true);
+        // Pending APFLG PF/AF may stay out of NZCV across an instruction that
+        // cannot fault or leave the block; anything else sees them in NZCV.
+        const bool SideEffects = Thread->OpDispatcher->CanHaveSideEffects(TableInfo, DecodedInfo);
+        Thread->OpDispatcher->FlushRegisterCache(true, false, !SideEffects);
 
-        if (ExtendedDebugInfo || Thread->OpDispatcher->CanHaveSideEffects(TableInfo, DecodedInfo)) {
+        if (ExtendedDebugInfo || SideEffects) {
           Thread->OpDispatcher->_GuestOpcode(InstAddress - GuestRIP);
         }
 
@@ -737,13 +753,19 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
               LogMan::Msg::EFmt("Invalid or Unknown instruction: {} 0x{:x}", TableInfo->Name ?: "UND", Block.Entry - GuestRIP);
             }
 
-            if (Block.BlockStatus == Frontend::Decoder::DecodedBlockStatus::INVALID_INST ||
-                Block.BlockStatus == Frontend::Decoder::DecodedBlockStatus::BAD_RELOCATION) {
+            if (Block.BlockStatus == Frontend::Decoder::DecodedBlockStatus::BREAKPOINT_0 ||
+                Block.BlockStatus == Frontend::Decoder::DecodedBlockStatus::BREAKPOINT_1 ||
+                Block.BlockStatus == Frontend::Decoder::DecodedBlockStatus::BREAKPOINT_2 ||
+                Block.BlockStatus == Frontend::Decoder::DecodedBlockStatus::BREAKPOINT_3) {
+              Thread->OpDispatcher->BreakpointOp(DecodedInfo, FEXCore::ToUnderlying(Block.BlockStatus) -
+                                                                FEXCore::ToUnderlying(Frontend::Decoder::DecodedBlockStatus::BREAKPOINT_0));
+            } else if (Block.BlockStatus == Frontend::Decoder::DecodedBlockStatus::INVALID_INST ||
+                       Block.BlockStatus == Frontend::Decoder::DecodedBlockStatus::BAD_RELOCATION) {
               Thread->OpDispatcher->InvalidOp(DecodedInfo);
             } else if (Block.BlockStatus == Frontend::Decoder::DecodedBlockStatus::UNIMPLEMENTED_INST) {
               Thread->OpDispatcher->UnimplementedOp(DecodedInfo);
             } else {
-              Thread->OpDispatcher->NoExecOp(DecodedInfo);
+              Thread->OpDispatcher->NoExecOrPartialOp(DecodedInfo);
             }
           }
 
@@ -854,7 +876,7 @@ ContextImpl::CompileCodeResult ContextImpl::CompileCode(FEXCore::Core::InternalT
   // If the trap flag is set we generate single instruction blocks that each check to generate a single step exception.
   bool TFSet = Thread->CurrentFrame->State.flags[X86State::RFLAG_TF_RAW_LOC];
 
-  auto CompiledCode = Thread->CPUBackend->CompileCode(GuestRIP, Length, TotalInstructions == 1, &*IRView, DebugData.get(), TFSet);
+  auto CompiledCode = Thread->CPUBackend->EmitJITCode(GuestRIP, Length, TotalInstructions == 1, &*IRView, DebugData.get(), TFSet);
 
   // Release the IR
   Thread->OpDispatcher->DelayedDisownBuffer();

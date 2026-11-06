@@ -184,30 +184,35 @@ void OpDispatchBuilder::SecondaryALUOp(OpcodeArgs) {
   switch (Op->OP) {
   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x80), 0):
   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x81), 0):
+  case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x82), 0):
   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x83), 0):
     IROp = FEXCore::IR::IROps::OP_ADD;
     AtomicIROp = FEXCore::IR::IROps::OP_ATOMICFETCHADD;
     break;
   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x80), 1):
   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x81), 1):
+  case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x82), 1):
   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x83), 1):
     IROp = FEXCore::IR::IROps::OP_OR;
     AtomicIROp = FEXCore::IR::IROps::OP_ATOMICFETCHOR;
     break;
   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x80), 4):
   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x81), 4):
+  case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x82), 4):
   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x83), 4):
     IROp = FEXCore::IR::IROps::OP_ANDWITHFLAGS;
     AtomicIROp = FEXCore::IR::IROps::OP_ATOMICFETCHAND;
     break;
   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x80), 5):
   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x81), 5):
+  case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x82), 5):
   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x83), 5):
     IROp = FEXCore::IR::IROps::OP_SUB;
     AtomicIROp = FEXCore::IR::IROps::OP_ATOMICFETCHSUB;
     break;
   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x80), 6):
   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x81), 6):
+  case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x82), 6):
   case OPD(FEXCore::X86Tables::TYPE_GROUP_1, OpToIndex(0x83), 6):
     IROp = FEXCore::IR::IROps::OP_XOR;
     AtomicIROp = FEXCore::IR::IROps::OP_ATOMICFETCHXOR;
@@ -250,8 +255,12 @@ void OpDispatchBuilder::ADCOp(OpcodeArgs, uint32_t SrcIndex, bool DestRAX) {
     HandleNZCV_RMW();
     RectifyCarryInvert(true);
     Result = _AdcZeroWithFlags(OpSize, Before);
-    SetRFLAG<FEXCore::X86State::RFLAG_AF_RAW_LOC>(Before);
-    CalculatePF(Result);
+    if (APFLG()) {
+      CalculatePFAFFromHost(Result);
+    } else {
+      SetRFLAG<FEXCore::X86State::RFLAG_AF_RAW_LOC>(Before);
+      CalculatePF(Result);
+    }
     CFInverted = false;
   } else {
     Result = CalculateFlags_ADC(Size, Before, Src);
@@ -296,7 +305,7 @@ void OpDispatchBuilder::SBBOp(OpcodeArgs, uint32_t SrcIndex, bool DestRAX) {
 }
 
 void OpDispatchBuilder::SALCOp(OpcodeArgs) {
-  CalculateDeferredFlags();
+  CalculateDeferredFlags(true);
 
   auto Result = NZCVSelect(OpSize::i32Bit, CondClass::UGE /* CF = 1 */, _InlineConstant(0xffffffff), _InlineConstant(0));
 
@@ -616,7 +625,7 @@ Ref OpDispatchBuilder::SelectCC0All1(uint8_t OP) {
 }
 
 void OpDispatchBuilder::SETccOp(OpcodeArgs) {
-  CalculateDeferredFlags();
+  CalculateDeferredFlags(true);
 
   Ref SrcCond;
   if (auto Cond = DecodeNZCVCondition(Op->OP & 0xf); Cond) {
@@ -634,7 +643,7 @@ void OpDispatchBuilder::CMOVOp(OpcodeArgs) {
   const auto OP = Op->OP & 0xF;
   const auto ResultSize = std::max(OpSize::i32Bit, OpSizeFromSrc(Op));
 
-  CalculateDeferredFlags();
+  CalculateDeferredFlags(true);
 
   // Destination is always a GPR.
   Ref Dest = LoadSourceGPR_WithOpSize(Op, Op->Dest, GPRSize, Op->Flags);
@@ -1021,14 +1030,19 @@ void OpDispatchBuilder::TESTOp(OpcodeArgs, uint32_t SrcIndex, bool DestRAX) {
   } else if (Size < OpSize::i32Bit && AlwaysNonnegative) {
     // If we know the result is always nonnegative, we can use a 32-bit test.
     auto Res = _And(OpSize::i32Bit, Dest, Src);
-    CalculatePF(Res);
-    SetNZ_ZeroCV(OpSize::i32Bit, Res);
+    if (APFLG()) {
+      SetNZP_ZeroCV(OpSize::i32Bit, Res);
+    } else {
+      CalculatePF(Res);
+      SetNZ_ZeroCV(OpSize::i32Bit, Res);
+    }
   } else {
     HandleNZ00Write();
-    CalculatePF(_AndWithFlags(Size, Dest, Src));
+    CalculatePFAFFromHost(_AndWithFlags(Size, Dest, Src));
   }
 
   InvalidateAF();
+  AcidTestFlags(X86State::RFLAG_AF_RAW_LOC);
 }
 
 void OpDispatchBuilder::ARPLOp(OpcodeArgs) {
@@ -1435,6 +1449,7 @@ void OpDispatchBuilder::SHLOp(OpcodeArgs) {
 
   Ref Result = _Lshl(Size == OpSize::i64Bit ? OpSize::i64Bit : OpSize::i32Bit, Dest, Src);
   HandleShift(Op, Result, Dest, ShiftType::LSL, Src);
+  AcidTestFlags(X86State::RFLAG_AF_RAW_LOC);
 }
 
 void OpDispatchBuilder::SHLImmediateOp(OpcodeArgs, bool SHL1Bit) {
@@ -1448,6 +1463,7 @@ void OpDispatchBuilder::SHLImmediateOp(OpcodeArgs, bool SHL1Bit) {
   CalculateFlags_ShiftLeftImmediate(OpSizeFromSrc(Op), Result, Dest, Shift);
   CalculateDeferredFlags();
   StoreResultGPR(Op, Result);
+  AcidTestFlags(X86State::RFLAG_AF_RAW_LOC);
 }
 
 void OpDispatchBuilder::SHROp(OpcodeArgs) {
@@ -1457,6 +1473,8 @@ void OpDispatchBuilder::SHROp(OpcodeArgs) {
 
   auto ALUOp = _Lshr(std::max(OpSize::i32Bit, Size), Dest, Src);
   HandleShift(Op, ALUOp, Dest, ShiftType::LSR, Src);
+
+  AcidTestFlags(X86State::RFLAG_AF_RAW_LOC);
 }
 
 void OpDispatchBuilder::SHRImmediateOp(OpcodeArgs, bool SHR1Bit) {
@@ -1469,6 +1487,8 @@ void OpDispatchBuilder::SHRImmediateOp(OpcodeArgs, bool SHR1Bit) {
   CalculateFlags_ShiftRightImmediate(OpSizeFromSrc(Op), ALUOp, Dest, Shift);
   CalculateDeferredFlags();
   StoreResultGPR(Op, ALUOp);
+
+  AcidTestFlags(X86State::RFLAG_AF_RAW_LOC);
 }
 
 void OpDispatchBuilder::SHLDOp(OpcodeArgs) {
@@ -1512,6 +1532,8 @@ void OpDispatchBuilder::SHLDOp(OpcodeArgs) {
   Res = _Select(OpSize::i64Bit, OpSize::i64Bit, CondClass::EQ, Shift, Constant(0), Dest, Res);
 
   HandleShift(Op, Res, Dest, ShiftType::LSL, Shift);
+
+  AcidTestFlags(X86State::RFLAG_AF_RAW_LOC);
 }
 
 void OpDispatchBuilder::SHLDImmediateOp(OpcodeArgs) {
@@ -1543,6 +1565,8 @@ void OpDispatchBuilder::SHLDImmediateOp(OpcodeArgs) {
     // Ensure Zext still occurs
     StoreResultGPR(Op, Dest);
   }
+
+  AcidTestFlags(X86State::RFLAG_AF_RAW_LOC);
 }
 
 void OpDispatchBuilder::SHRDOp(OpcodeArgs) {
@@ -1577,6 +1601,8 @@ void OpDispatchBuilder::SHRDOp(OpcodeArgs) {
   Res = _Select(OpSize::i64Bit, OpSize::i64Bit, CondClass::EQ, Shift, Constant(0), Dest, Res);
 
   HandleShift(Op, Res, Dest, ShiftType::LSR, Shift);
+
+  AcidTestFlags(X86State::RFLAG_AF_RAW_LOC);
 }
 
 void OpDispatchBuilder::SHRDImmediateOp(OpcodeArgs) {
@@ -1607,6 +1633,8 @@ void OpDispatchBuilder::SHRDImmediateOp(OpcodeArgs) {
     // Ensure Zext still occurs
     StoreResultGPR(Op, Dest);
   }
+
+  AcidTestFlags(X86State::RFLAG_AF_RAW_LOC);
 }
 
 void OpDispatchBuilder::ASHROp(OpcodeArgs, bool Immediate, bool SHR1Bit) {
@@ -1636,6 +1664,8 @@ void OpDispatchBuilder::ASHROp(OpcodeArgs, bool Immediate, bool SHR1Bit) {
 
     HandleShift(Op, Result, Dest, ShiftType::ASR, Src);
   }
+
+  AcidTestFlags(X86State::RFLAG_AF_RAW_LOC);
 }
 
 void OpDispatchBuilder::RotateOp(OpcodeArgs, bool Left, bool IsImmediate, bool Is1Bit) {
@@ -1706,6 +1736,8 @@ void OpDispatchBuilder::ANDNBMIOp(OpcodeArgs) {
 
   StoreResultGPR(Op, Dest);
   CalculateFlags_Logical(OpSizeFromSrc(Op), Dest);
+
+  AcidTestFlags(X86State::RFLAG_AF_RAW_LOC, X86State::RFLAG_PF_RAW_LOC);
 }
 
 void OpDispatchBuilder::BEXTRBMIOp(OpcodeArgs) {
@@ -1749,6 +1781,8 @@ void OpDispatchBuilder::BEXTRBMIOp(OpcodeArgs) {
   // AF are undefined.
   SetNZ_ZeroCV(GetOpSize(Dest), Dest);
   InvalidatePF_AF();
+
+  AcidTestFlags(X86State::RFLAG_SF_RAW_LOC, X86State::RFLAG_AF_RAW_LOC, X86State::RFLAG_PF_RAW_LOC);
 }
 
 void OpDispatchBuilder::BLSIBMIOp(OpcodeArgs) {
@@ -1770,6 +1804,8 @@ void OpDispatchBuilder::BLSIBMIOp(OpcodeArgs) {
   SetNZ_ZeroCV(Size, Result);
   InvalidatePF_AF();
   SetCFInverted(GetRFLAG(X86State::RFLAG_ZF_RAW_LOC));
+
+  AcidTestFlags(X86State::RFLAG_AF_RAW_LOC, X86State::RFLAG_PF_RAW_LOC);
 }
 
 void OpDispatchBuilder::BLSMSKBMIOp(OpcodeArgs) {
@@ -1790,6 +1826,8 @@ void OpDispatchBuilder::BLSMSKBMIOp(OpcodeArgs) {
   // and O) while setting S.
   SetNZ_ZeroCV(Size, Result);
   SetCFInverted(CFInv);
+
+  AcidTestFlags(X86State::RFLAG_AF_RAW_LOC, X86State::RFLAG_PF_RAW_LOC);
 }
 
 void OpDispatchBuilder::BLSRBMIOp(OpcodeArgs) {
@@ -1807,6 +1845,8 @@ void OpDispatchBuilder::BLSRBMIOp(OpcodeArgs) {
   SetNZ_ZeroCV(Size, Result);
   SetCFInverted(CFInv);
   InvalidatePF_AF();
+
+  AcidTestFlags(X86State::RFLAG_AF_RAW_LOC, X86State::RFLAG_PF_RAW_LOC);
 }
 
 // Handles SARX, SHLX, and SHRX
@@ -1866,6 +1906,8 @@ void OpDispatchBuilder::BZHI(OpcodeArgs) {
   InvalidatePF_AF();
   SetNZ_ZeroCV(Size, Result);
   SetCFInverted(CFInv);
+
+  AcidTestFlags(X86State::RFLAG_AF_RAW_LOC, X86State::RFLAG_PF_RAW_LOC);
 }
 
 void OpDispatchBuilder::RORX(OpcodeArgs) {
@@ -1953,8 +1995,25 @@ void OpDispatchBuilder::ADXOp(OpcodeArgs) {
   const bool IsADCX = Op->OP == 0x1F6;
   auto Zero = Constant(0);
 
-  // Before we go trashing NZCV, save the current NZCV state.
-  Ref OldNZCV = GetNZCV();
+  // Before we go trashing NZCV, save the current NZCV state. ADCX/ADOX keep
+  // PF/AF: under APFLG take them from the known values or from NZCV, without
+  // merging pending ones into a copy that would then have to be stored.
+  Ref OldPF {}, OldAF {}, OldPFInv {}, OldNZCV {};
+  if (APFLG()) {
+    OldPF = LazyPF;
+    OldAF = LazyAF;
+    OldPFInv = LazyPFInv;
+    // Only bits 28-31 are needed when PF/AF are known.
+    OldNZCV = CachedNZCV ? CachedNZCV : (OldPF && OldAF) ? _LoadNZCVOnly() : _LoadNZCV();
+    if (!OldPF) {
+      OldPF = _Bfe(OpSize::i32Bit, 1, APFLG_PF_BIT, OldNZCV);
+    }
+    if (!OldAF) {
+      OldAF = _Bfe(OpSize::i32Bit, 1, APFLG_AF_BIT, OldNZCV);
+    }
+  } else {
+    OldNZCV = GetNZCV();
+  }
 
   // We want to use arm64 adc. For ADOX, copy the overflow flag into CF.  For
   // ADCX, we just rectify the carry.
@@ -1979,6 +2038,11 @@ void OpDispatchBuilder::ADXOp(OpcodeArgs) {
     }
 
     _RmifNZCV(OldNZCV, 28, IsADCX ? 0xd /* NzcV */ : 0xe /* NZCv */);
+
+    if (APFLG()) {
+      // RMIF restores NZCV only; ADCS clobbered PF/AF, which stay pending.
+      SetAPFLGBits(OldPF, OldAF, OldPFInv);
+    }
   } else {
     // For either operation, insert the new flag into the old NZCV.
     bool SavedCFInvert = CFInverted;
@@ -2590,6 +2654,9 @@ void OpDispatchBuilder::BTOp(OpcodeArgs, uint32_t SrcIndex, BTAction Action) {
     // to insert into CF directly. We could optimize perhaps.
     SetCFDirect(Value, 0, true);
   }
+
+  AcidTestFlags(X86State::RFLAG_OF_RAW_LOC, X86State::RFLAG_SF_RAW_LOC, X86State::RFLAG_ZF_RAW_LOC, X86State::RFLAG_AF_RAW_LOC,
+                X86State::RFLAG_PF_RAW_LOC);
 }
 
 void OpDispatchBuilder::IMUL1SrcOp(OpcodeArgs) {
@@ -2629,6 +2696,8 @@ void OpDispatchBuilder::IMUL1SrcOp(OpcodeArgs) {
 
   StoreResultGPR(Op, Dest);
   CalculateFlags_MUL(Size, Dest, ResultHigh);
+
+  AcidTestFlags(X86State::RFLAG_SF_RAW_LOC, X86State::RFLAG_ZF_RAW_LOC, X86State::RFLAG_AF_RAW_LOC, X86State::RFLAG_PF_RAW_LOC);
 }
 
 void OpDispatchBuilder::IMUL2SrcOp(OpcodeArgs) {
@@ -2668,6 +2737,8 @@ void OpDispatchBuilder::IMUL2SrcOp(OpcodeArgs) {
 
   StoreResultGPR(Op, Dest);
   CalculateFlags_MUL(Size, Dest, ResultHigh);
+
+  AcidTestFlags(X86State::RFLAG_SF_RAW_LOC, X86State::RFLAG_ZF_RAW_LOC, X86State::RFLAG_AF_RAW_LOC, X86State::RFLAG_PF_RAW_LOC);
 }
 
 void OpDispatchBuilder::IMULOp(OpcodeArgs) {
@@ -2723,6 +2794,8 @@ void OpDispatchBuilder::IMULOp(OpcodeArgs) {
   }
 
   CalculateFlags_MUL(Size, Result, ResultHigh);
+
+  AcidTestFlags(X86State::RFLAG_SF_RAW_LOC, X86State::RFLAG_ZF_RAW_LOC, X86State::RFLAG_AF_RAW_LOC, X86State::RFLAG_PF_RAW_LOC);
 }
 
 void OpDispatchBuilder::MULOp(OpcodeArgs) {
@@ -2891,8 +2964,10 @@ void OpDispatchBuilder::DAAOp(OpcodeArgs) {
   StoreGPRRegister(X86State::REG_RAX, AL, OpSize::i8Bit);
   SetNZ_ZeroCV(OpSize::i8Bit, AL);
   SetCFInverted(CFInv);
-  CalculatePF(AL);
+  CalculatePFAFFromHost(AL);
   SetAFAndFixup(AF);
+
+  AcidTestFlags(X86State::RFLAG_OF_RAW_LOC);
 }
 
 void OpDispatchBuilder::DASOp(OpcodeArgs) {
@@ -2917,8 +2992,10 @@ void OpDispatchBuilder::DASOp(OpcodeArgs) {
   StoreGPRRegister(X86State::REG_RAX, AL, OpSize::i8Bit);
   SetNZ_ZeroCV(OpSize::i8Bit, AL);
   SetCFDirect(NewCF);
-  CalculatePF(AL);
+  CalculatePFAFFromHost(AL);
   SetAFAndFixup(AF);
+
+  AcidTestFlags(X86State::RFLAG_OF_RAW_LOC);
 }
 
 void OpDispatchBuilder::AAAOp(OpcodeArgs) {
@@ -2936,6 +3013,7 @@ void OpDispatchBuilder::AAAOp(OpcodeArgs) {
   // AL = AL & 0x0F
   A = _And(OpSize::i32Bit, A, Constant(0xFF0F));
   StoreGPRRegister(X86State::REG_RAX, A, OpSize::i16Bit);
+  AcidTestFlags(X86State::RFLAG_OF_RAW_LOC, X86State::RFLAG_SF_RAW_LOC, X86State::RFLAG_ZF_RAW_LOC, X86State::RFLAG_PF_RAW_LOC);
 }
 
 void OpDispatchBuilder::AASOp(OpcodeArgs) {
@@ -2953,6 +3031,8 @@ void OpDispatchBuilder::AASOp(OpcodeArgs) {
   // AL = AL & 0x0F
   A = _And(OpSize::i32Bit, A, Constant(0xFF0F));
   StoreGPRRegister(X86State::REG_RAX, A, OpSize::i16Bit);
+
+  AcidTestFlags(X86State::RFLAG_OF_RAW_LOC, X86State::RFLAG_SF_RAW_LOC, X86State::RFLAG_ZF_RAW_LOC, X86State::RFLAG_PF_RAW_LOC);
 }
 
 void OpDispatchBuilder::AAMOp(OpcodeArgs) {
@@ -2965,8 +3045,10 @@ void OpDispatchBuilder::AAMOp(OpcodeArgs) {
   StoreGPRRegister(X86State::REG_RAX, Res, OpSize::i16Bit);
 
   SetNZ_ZeroCV(OpSize::i8Bit, Res);
-  CalculatePF(Res);
+  CalculatePFAFFromHost(Res);
   InvalidateAF();
+
+  AcidTestFlags(X86State::RFLAG_OF_RAW_LOC, X86State::RFLAG_AF_RAW_LOC, X86State::RFLAG_CF_RAW_LOC);
 }
 
 void OpDispatchBuilder::AADOp(OpcodeArgs) {
@@ -2978,8 +3060,10 @@ void OpDispatchBuilder::AADOp(OpcodeArgs) {
   StoreGPRRegister(X86State::REG_RAX, Result, OpSize::i16Bit);
 
   SetNZ_ZeroCV(OpSize::i8Bit, Result);
-  CalculatePF(Result);
+  CalculatePFAFFromHost(Result);
   InvalidateAF();
+
+  AcidTestFlags(X86State::RFLAG_OF_RAW_LOC, X86State::RFLAG_AF_RAW_LOC, X86State::RFLAG_CF_RAW_LOC);
 }
 
 void OpDispatchBuilder::XLATOp(OpcodeArgs) {
@@ -3127,7 +3211,38 @@ void OpDispatchBuilder::SMSWOp(OpcodeArgs) {
   }
 
   if (IsMemDst) {
-    // Memory destinatino always writes only 16-bits.
+    // Memory destination always writes only 16-bits.
+    DstSize = OpSize::i16Bit;
+  }
+
+  StoreResultGPR_WithOpSize(Op, Op->Dest, Const, DstSize);
+}
+
+void OpDispatchBuilder::SLDTOp(OpcodeArgs) {
+  const bool IsMemDst = DestIsMem(Op);
+
+  IR::OpSize DstSize {OpSize::iInvalid};
+  Ref Const = _Constant(0);
+
+  const auto OpAddr = X86Tables::DecodeFlags::GetOpAddr(Op->Flags, 0);
+  if (Is64BitMode) {
+    DstSize = OpAddr == X86Tables::DecodeFlags::FLAG_OPERAND_SIZE_LAST  ? OpSize::i16Bit :
+              OpAddr == X86Tables::DecodeFlags::FLAG_WIDENING_SIZE_LAST ? OpSize::i64Bit :
+                                                                          OpSize::i32Bit;
+
+    if (!IsMemDst && DstSize == OpSize::i32Bit) {
+      // Special-case version of `sldt ebx`. This instruction does an insert in to the lower 32-bits on 64-bit hosts.
+      // Override and insert.
+      auto Dest = LoadSourceGPR_WithOpSize(Op, Op->Dest, GetGPROpSize(), Op->Flags);
+      Const = _Bfi(OpSize::i64Bit, 32, 0, Dest, Const);
+      DstSize = OpSize::i64Bit;
+    }
+  } else {
+    DstSize = OpAddr == X86Tables::DecodeFlags::FLAG_OPERAND_SIZE_LAST ? OpSize::i16Bit : OpSize::i32Bit;
+  }
+
+  if (IsMemDst) {
+    // Memory destination always writes only 16-bits.
     DstSize = OpSize::i16Bit;
   }
 
@@ -3178,8 +3293,10 @@ void OpDispatchBuilder::INCOp(OpcodeArgs) {
   if (Size < 32 && CTX->HostFeatures.SupportsFlagM) {
     // Addition producing upper garbage
     Result = Add(OpSize::i32Bit, Dest, 1);
-    CalculatePF(Result);
-    CalculateAF(Dest, Constant(1));
+    if (!APFLG()) {
+      CalculatePF(Result);
+      CalculateAF(Dest, Constant(1));
+    }
 
     // Correctly set NZ flags, preserving C
     HandleNZCV_RMW();
@@ -3188,6 +3305,12 @@ void OpDispatchBuilder::INCOp(OpcodeArgs) {
     // Fix up V flag. INC overflows only when incrementing a positive and
     // getting a negative. So compare the sign bits to calculate V.
     _RmifNZCV(_Andn(OpSize::i32Bit, Result, Dest), Size - 1, 1);
+
+    // SETF8/SETF16 clobber PF under APFLG, so insert PF/AF afterwards.
+    if (APFLG()) {
+      CalculateAF(Dest, Constant(1));
+      CalculatePF(Result);
+    }
   } else {
     Result = CalculateFlags_ADD(OpSizeFromSrc(Op), Dest, Constant(1), false);
   }
@@ -3219,8 +3342,10 @@ void OpDispatchBuilder::DECOp(OpcodeArgs) {
   if (Size < 32 && CTX->HostFeatures.SupportsFlagM) {
     // Subtraction producing upper garbage
     Result = Sub(OpSize::i32Bit, Dest, 1);
-    CalculatePF(Result);
-    CalculateAF(Dest, Constant(1));
+    if (!APFLG()) {
+      CalculatePF(Result);
+      CalculateAF(Dest, Constant(1));
+    }
 
     // Correctly set NZ flags, preserving C
     HandleNZCV_RMW();
@@ -3229,6 +3354,12 @@ void OpDispatchBuilder::DECOp(OpcodeArgs) {
     // Fix up V flag. DEC overflows only when decrementing a negative and
     // getting a positive. So compare the sign bits to calculate V.
     _RmifNZCV(_Andn(OpSize::i32Bit, Dest, Result), Size - 1, 1);
+
+    // SETF8/SETF16 clobber PF under APFLG, so insert PF/AF afterwards.
+    if (APFLG()) {
+      CalculateAF(Dest, Constant(1));
+      CalculatePF(Result);
+    }
   } else {
     Result = CalculateFlags_SUB(OpSizeFromSrc(Op), Dest, Constant(1), false);
   }
@@ -3779,6 +3910,10 @@ void OpDispatchBuilder::DIVOp(OpcodeArgs) {
     StoreGPRRegister(X86State::REG_RAX, Quotient, Size);
     StoreGPRRegister(X86State::REG_RDX, Remainder, Size);
   }
+
+  // All flags are undefined.
+  AcidTestFlags(X86State::RFLAG_OF_RAW_LOC, X86State::RFLAG_SF_RAW_LOC, X86State::RFLAG_ZF_RAW_LOC, X86State::RFLAG_AF_RAW_LOC,
+                X86State::RFLAG_PF_RAW_LOC, X86State::RFLAG_CF_RAW_LOC);
 }
 
 void OpDispatchBuilder::IDIVOp(OpcodeArgs) {
@@ -3822,6 +3957,10 @@ void OpDispatchBuilder::IDIVOp(OpcodeArgs) {
     StoreGPRRegister(X86State::REG_RAX, Quotient, Size);
     StoreGPRRegister(X86State::REG_RDX, Remainder, Size);
   }
+
+  // All flags are undefined.
+  AcidTestFlags(X86State::RFLAG_OF_RAW_LOC, X86State::RFLAG_SF_RAW_LOC, X86State::RFLAG_ZF_RAW_LOC, X86State::RFLAG_AF_RAW_LOC,
+                X86State::RFLAG_PF_RAW_LOC, X86State::RFLAG_CF_RAW_LOC);
 }
 
 void OpDispatchBuilder::BSFOp(OpcodeArgs) {
@@ -3844,6 +3983,9 @@ void OpDispatchBuilder::BSFOp(OpcodeArgs) {
   // applications might rely on that in the wild.
   auto SelectOp = NZCVSelect(GPRSize, CondClass::EQ, Dest, Result);
   StoreResultGPR_WithOpSize(Op, Op->Dest, SelectOp, DstSize);
+
+  AcidTestFlags(X86State::RFLAG_OF_RAW_LOC, X86State::RFLAG_SF_RAW_LOC, X86State::RFLAG_AF_RAW_LOC, X86State::RFLAG_PF_RAW_LOC,
+                X86State::RFLAG_CF_RAW_LOC);
 }
 
 void OpDispatchBuilder::BSROp(OpcodeArgs) {
@@ -3862,6 +4004,9 @@ void OpDispatchBuilder::BSROp(OpcodeArgs) {
   // If Src was zero then the destination doesn't get modified
   auto SelectOp = NZCVSelect(GPRSize, CondClass::EQ, Dest, Result);
   StoreResultGPR_WithOpSize(Op, Op->Dest, SelectOp, DstSize);
+
+  AcidTestFlags(X86State::RFLAG_OF_RAW_LOC, X86State::RFLAG_SF_RAW_LOC, X86State::RFLAG_AF_RAW_LOC, X86State::RFLAG_PF_RAW_LOC,
+                X86State::RFLAG_CF_RAW_LOC);
 }
 
 void OpDispatchBuilder::CMPXCHGOp(OpcodeArgs) {
@@ -4729,7 +4874,7 @@ void OpDispatchBuilder::ALUOp(OpcodeArgs, FEXCore::IR::IROps ALUIROp, FEXCore::I
     auto Zero = LoadGPR(Op->Dest.Data.GPR.GPR);
     HandleNZ00Write();
     InvalidateAF();
-    CalculatePF(SubWithFlags(OpSize::i32Bit, Zero, Zero));
+    CalculatePFAFFromHost(SubWithFlags(OpSize::i32Bit, Zero, Zero));
     CFInverted = true;
     FlushRegisterCache();
 
@@ -4807,12 +4952,14 @@ void OpDispatchBuilder::ALUOp(OpcodeArgs, FEXCore::IR::IROps ALUIROp, FEXCore::I
   case FEXCore::IR::IROps::OP_AND:
   case FEXCore::IR::IROps::OP_OR: {
     CalculateFlags_Logical(Size, Result);
+    AcidTestFlags(X86State::RFLAG_AF_RAW_LOC);
     break;
   }
   case FEXCore::IR::IROps::OP_ANDWITHFLAGS: {
     HandleNZ00Write();
-    CalculatePF(Result);
+    CalculatePFAFFromHost(Result);
     InvalidateAF();
+    AcidTestFlags(X86State::RFLAG_AF_RAW_LOC);
     break;
   }
   default: break;
@@ -4839,7 +4986,7 @@ void OpDispatchBuilder::INTOp(OpcodeArgs) {
   case 0xCD: { // INT imm8
     uint8_t Literal = Op->Src[0].Literal();
 
-    if (CTX->HostFeatures.HostType == FEXCore::HostFeatures::HostTypeEnum::Linux) {
+    if (CTX->HostFeatures.ProcessFeatures.HostType == FEXCore::HostFeatures::HostTypeEnum::Linux) {
       constexpr uint8_t SYSCALL_LITERAL = 0x80;
       if (Literal == SYSCALL_LITERAL) {
         if (Is64BitMode) [[unlikely]] {
@@ -4851,8 +4998,8 @@ void OpDispatchBuilder::INTOp(OpcodeArgs) {
         SyscallOp(Op, false);
         return;
       }
-    } else if (CTX->HostFeatures.HostType == FEXCore::HostFeatures::HostTypeEnum::Wow64 ||
-               CTX->HostFeatures.HostType == FEXCore::HostFeatures::HostTypeEnum::Arm64ec) {
+    } else if (CTX->HostFeatures.ProcessFeatures.HostType == FEXCore::HostFeatures::HostTypeEnum::Wow64 ||
+               CTX->HostFeatures.ProcessFeatures.HostType == FEXCore::HostFeatures::HostTypeEnum::Arm64ec) {
       constexpr uint8_t SYSCALL_LITERAL = 0x2E;
       if (Literal == SYSCALL_LITERAL) {
         // Can be used for both 64-bit and 32-bit syscalls on windows
@@ -4860,7 +5007,7 @@ void OpDispatchBuilder::INTOp(OpcodeArgs) {
         return;
       }
 
-      if (CTX->HostFeatures.HostType == FEXCore::HostFeatures::HostTypeEnum::Arm64ec) {
+      if (CTX->HostFeatures.ProcessFeatures.HostType == FEXCore::HostFeatures::HostTypeEnum::Arm64ec) {
         // This is used when QueryPerformanceCounter is called on recent Windows versions, it causes CNTVCT to be written into RAX.
         constexpr uint8_t GET_CNTVCT_LITERAL = 0x81;
         if (Literal == GET_CNTVCT_LITERAL) {
@@ -4963,6 +5110,8 @@ void OpDispatchBuilder::TZCNT(OpcodeArgs) {
   StoreResultGPR(Op, Src);
 
   CalculateFlags_ZCNT(OpSizeFromSrc(Op), Src);
+
+  AcidTestFlags(X86State::RFLAG_OF_RAW_LOC, X86State::RFLAG_SF_RAW_LOC, X86State::RFLAG_AF_RAW_LOC, X86State::RFLAG_PF_RAW_LOC);
 }
 
 void OpDispatchBuilder::LZCNT(OpcodeArgs) {
@@ -4972,6 +5121,7 @@ void OpDispatchBuilder::LZCNT(OpcodeArgs) {
   auto Res = _CountLeadingZeroes(OpSizeFromSrc(Op), Src);
   StoreResultGPR(Op, Res);
   CalculateFlags_ZCNT(OpSizeFromSrc(Op), Res);
+  AcidTestFlags(X86State::RFLAG_OF_RAW_LOC, X86State::RFLAG_SF_RAW_LOC, X86State::RFLAG_AF_RAW_LOC, X86State::RFLAG_PF_RAW_LOC);
 }
 
 void OpDispatchBuilder::MOVBEOp(OpcodeArgs) {
@@ -5050,6 +5200,11 @@ void OpDispatchBuilder::StoreFenceOrCLFlush(OpcodeArgs) {
   }
 }
 
+void OpDispatchBuilder::SerializeOp(OpcodeArgs) {
+  _Fence(FenceType::Inst);
+  _Fence(FenceType::Store);
+}
+
 void OpDispatchBuilder::UMonitorOrCLRSSBSY(OpcodeArgs) {
   if (DestIsMem(Op) || !CTX->HostFeatures.SupportsWFXT) {
     // CLRSSBSY
@@ -5098,7 +5253,7 @@ void OpDispatchBuilder::RDTSCPOp(OpcodeArgs) {
   //  - Explicitly use an MFENCE before this instruction if you want this behaviour
   // This instruction is not an execution fence, so subsequent instructions can execute after this
   //  - Explicitly use an LFENCE after RDTSCP if you want to block this behaviour
-  if (CTX->HostFeatures.HostType != FEXCore::HostFeatures::HostTypeEnum::Linux && !CTX->HostFeatures.SupportsCPUIndexInTPIDRRO) {
+  if (CTX->HostFeatures.ProcessFeatures.HostType != FEXCore::HostFeatures::HostTypeEnum::Linux && !CTX->HostFeatures.SupportsCPUIndexInTPIDRRO) {
     // RDTSCP is unsupported on Win32 platforms if TPIDRRO isn't supported.
     UnimplementedOp(Op);
     return;
@@ -5112,7 +5267,7 @@ void OpDispatchBuilder::RDTSCPOp(OpcodeArgs) {
 }
 
 void OpDispatchBuilder::RDPIDOp(OpcodeArgs) {
-  if (CTX->HostFeatures.HostType != FEXCore::HostFeatures::HostTypeEnum::Linux && !CTX->HostFeatures.SupportsCPUIndexInTPIDRRO) {
+  if (CTX->HostFeatures.ProcessFeatures.HostType != FEXCore::HostFeatures::HostTypeEnum::Linux && !CTX->HostFeatures.SupportsCPUIndexInTPIDRRO) {
     // RDTSCP is unsupported on Win32 platforms if TPIDRRO isn't supported.
     UnimplementedOp(Op);
     return;
@@ -5168,14 +5323,13 @@ void OpDispatchBuilder::RDRANDOp(OpcodeArgs, bool Reseed) {
   }
 }
 
-void OpDispatchBuilder::BreakOp(OpcodeArgs, FEXCore::IR::BreakDefinition BreakDefinition) {
+void OpDispatchBuilder::BreakOp(OpcodeArgs, FEXCore::IR::BreakDefinition BreakDefinition, Ref RelocatedPC) {
   const auto GPRSize = GetGPROpSize();
 
   // We don't actually support this instruction
   // Multiblock may hit it though
   _StoreContextGPR(GPRSize, GetRelocatedPC(Op, -Op->InstSize), offsetof(FEXCore::Core::CPUState, rip));
-  Break(BreakDefinition);
-
+  Break(BreakDefinition, RelocatedPC);
 
   if (Multiblock) {
     auto NextBlock = CreateNewCodeBlockAfter(GetCurrentBlock());
@@ -5184,6 +5338,25 @@ void OpDispatchBuilder::BreakOp(OpcodeArgs, FEXCore::IR::BreakDefinition BreakDe
   } else {
     BlockSetRIP = true;
   }
+}
+
+void OpDispatchBuilder::BreakpointOp(OpcodeArgs, uint32_t BP) {
+  const auto GPRSize = GetGPROpSize();
+  auto NewRIP = GetRelocatedPC(Op, -Op->InstSize);
+  _StoreContextGPR(GPRSize, NewRIP, offsetof(FEXCore::Core::CPUState, rip));
+
+  uint32_t DR6Value {1U << BP};
+  _StoreContextGPR(GPRSize, _Constant(DR6Value), offsetof(FEXCore::Core::CPUState, Dr6));
+
+  IR::BreakDefinition Reason;
+  Reason.ErrorRegister = 0;
+  Reason.Signal = Core::FAULT_SIGTRAP;
+  Reason.TrapNumber = X86State::X86_TRAPNO_DB;
+  Reason.si_code = 0x80;
+
+  Break(Reason);
+
+  BlockSetRIP = true;
 }
 
 void OpDispatchBuilder::UnimplementedOp(OpcodeArgs) {
@@ -5213,13 +5386,21 @@ void OpDispatchBuilder::InvalidOp(OpcodeArgs) {
               });
 }
 
-void OpDispatchBuilder::NoExecOp(OpcodeArgs) {
-  BreakOp(Op, FEXCore::IR::BreakDefinition {
-                .ErrorRegister = X86State::X86_PF_PROT | X86State::X86_PF_USER | X86State::X86_PF_INSTR,
-                .Signal = Core::FAULT_SIGSEGV,
-                .TrapNumber = X86State::X86_TRAPNO_PF,
-                .si_code = 2, // SEGV_ACCERR
-              });
+void OpDispatchBuilder::NoExecOrPartialOp(OpcodeArgs) {
+  // Partial decoded or fully no-exec instruction.
+  // Get the RIP inside the instruction where it failed to decode.
+  // - Full no-exec will be the first byte.
+  // - Partial will be the first byte that failed to decode.
+  auto RelocatedPC = GetRelocatedPC(Op, 0);
+
+  BreakOp(Op,
+          FEXCore::IR::BreakDefinition {
+            .ErrorRegister = X86State::X86_PF_PROT | X86State::X86_PF_USER | X86State::X86_PF_INSTR,
+            .Signal = Core::FAULT_SIGSEGV,
+            .TrapNumber = X86State::X86_TRAPNO_PF,
+            .si_code = 2, // SEGV_ACCERR
+          },
+          RelocatedPC);
 }
 
 #undef OpcodeArgs

@@ -409,17 +409,18 @@ namespace DiskCache {
       uint64_t HostFeaturesHash;
     } MachineBucketData = {FormatVersion, HostFeatureHash.HostFeaturesHash};
 
-    fextl::vector<uint8_t> BucketBytes(sizeof(MachineBucketData) + (sizeof(uint8_t) * 2) + SerializedConfig.size());
+    fextl::vector<uint8_t> BucketBytes(sizeof(MachineBucketData) + sizeof(HostFeatureHash.ProcessFeaturesHash) + SerializedConfig.size());
     memcpy(BucketBytes.data(), &MachineBucketData, sizeof(MachineBucketData));
 
     // 64-bit mode and HostType is in the ProcessBucket hash only instead of the MachineBucketHash
     // These effect code-gen, but they aren't part of the MachineBucketHash, as it comes from Process state.
-    BucketBytes[sizeof(MachineBucketData)] = CTX->Config.Is64BitMode;
-    BucketBytes[sizeof(MachineBucketData) + 1] = FEXCore::ToUnderlying(HostFeatureHash.HostType);
-    memcpy(BucketBytes.data() + sizeof(MachineBucketData) + 2, SerializedConfig.data(), SerializedConfig.size());
+    memcpy(&BucketBytes[sizeof(MachineBucketData)], &HostFeatureHash.ProcessFeaturesHash, sizeof(HostFeatureHash.ProcessFeaturesHash));
+    memcpy(BucketBytes.data() + sizeof(MachineBucketData) + sizeof(HostFeatureHash.ProcessFeaturesHash), SerializedConfig.data(),
+           SerializedConfig.size());
 
     uint64_t MachineBucketHash = XXH3_64bits(BucketBytes.data(), sizeof(MachineBucketData));
-    uint64_t ProcessBucketHash = XXH3_64bits(BucketBytes.data() + sizeof(MachineBucketData), 2 + SerializedConfig.size());
+    uint64_t ProcessBucketHash =
+      XXH3_64bits(BucketBytes.data() + sizeof(MachineBucketData), sizeof(HostFeatureHash.ProcessFeaturesHash) + SerializedConfig.size());
     BucketHash.high64 = MachineBucketHash;
     BucketHash.low64 = ProcessBucketHash;
 
@@ -1026,9 +1027,8 @@ namespace DiskCache {
     const size_t TotalSize = GuestCodeOffset + GuestCode.size();
 
     // we'll copy everything into here and pass it to the Writer, then return to caller quickly
-    fextl::vector<uint8_t> Blob;
-    Blob.resize(TotalSize);
-    uint8_t* BlobData = Blob.data();
+    auto BlobRef = fextl::make_shared<fextl::vector<uint8_t>>(TotalSize);
+    uint8_t* BlobData = BlobRef->data();
 
     BlobFixedHeader Header {
       .GuestSize = (uint32_t)GuestCode.size(),
@@ -1182,7 +1182,6 @@ namespace DiskCache {
       MakeLookupKey(Thread, GuestCodeKey, RangeInfo.Writable, GuestRIP == CTX->GetMonoBackPatcherBlock().load(std::memory_order_relaxed));
 
     // blob done, publish to index as in-memory for now, flush to disk below
-    auto BlobRef = fextl::make_shared<fextl::vector<uint8_t>>(std::move(Blob));
     struct IndexEntry NewEntry {nullptr, 0, (uint32_t)TotalSize, Header.GuestSize, Header.GuestHash, BlobRef};
     NewEntry.GuestExtents = ExactGuestCodeExtents;
     {

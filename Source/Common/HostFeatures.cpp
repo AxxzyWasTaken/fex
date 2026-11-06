@@ -8,6 +8,7 @@
 #include <FEXCore/Config/Config.h>
 #include <FEXCore/Core/HostFeatures.h>
 #include <FEXCore/Utils/FileLoading.h>
+#include <FEXCore/Utils/PrctlUtils.h>
 #include <FEXCore/Utils/StringUtils.h>
 
 #include <range/v3/view/split.hpp>
@@ -15,6 +16,11 @@
 
 #ifdef ARCHITECTURE_x86_64
 #include "Common/X86Features.h"
+#endif
+
+#if defined(ARCHITECTURE_arm64) && !defined(_WIN32) && !defined(VIXL_SIMULATOR)
+#include <sys/auxv.h>
+#include <sys/prctl.h>
 #endif
 
 namespace FEX {
@@ -376,6 +382,9 @@ static void OverrideFeatures(FEXCore::HostFeatures* Features, uint64_t ForceSVEW
   ENABLE_DISABLE_OPTION(SupportsMOPS, MOPS, MOPS);
   ENABLE_DISABLE_OPTION(SupportsI8MM, I8MM, I8MM);
   ENABLE_DISABLE_OPTION(SupportsDotProd, DOTPROD, DOTPROD);
+  ENABLE_DISABLE_OPTION(SupportsBF16, BF16, BF16);
+  ENABLE_DISABLE_OPTION(SupportsCPUIndexInTPIDRRO, TPIDRRO, TPIDRRO);
+  ENABLE_DISABLE_OPTION(SupportsAPFLG, APFLG, APFLG);
   GET_SINGLE_OPTION(Crypto, CRYPTO);
 
 #undef ENABLE_DISABLE_OPTION
@@ -508,6 +517,7 @@ void FetchHostFeatures(FEX::CPUFeatures& Features, FEXCore::HostFeatures& HostFe
   HostFeatures.SupportsWFXT = Features.Supports(CPUFeatures::Feature::WFxt);
   HostFeatures.SupportsI8MM = Features.Supports(CPUFeatures::Feature::I8MM);
   HostFeatures.SupportsDotProd = Features.Supports(CPUFeatures::Feature::DotProd);
+  HostFeatures.SupportsBF16 = Features.Supports(CPUFeatures::Feature::BF16);
 
 #ifdef VIXL_SIMULATOR
   // Hardcode enable SVE with 256-bit wide registers.
@@ -595,11 +605,40 @@ void FetchHostFeatures(FEX::CPUFeatures& Features, FEXCore::HostFeatures& HostFe
   HostFeatures.SupportsFloatExceptions = true;
 #endif
 
+#if defined(ARCHITECTURE_arm64) && !defined(_WIN32) && !defined(VIXL_SIMULATOR)
+  // Apple's x86 parity/adjust flags (APFLG). An Aurora kernel advertises it as
+  // HWCAP3_APPLE_APFLG and turns it on per thread with PR_AURORA_SET_X86_FLAGS;
+  // the setting is inherited by threads created afterwards and reset by execve.
+  // The JIT relies on FlagM (RMIF) to restore NZCV around 8/16-bit flags.
+  constexpr unsigned long AT_HWCAP3_ = 29;
+  constexpr unsigned long HWCAP3_APPLE_APFLG = 1UL << 63;
+  HostFeatures.SupportsAPFLG = (getauxval(AT_HWCAP3_) & HWCAP3_APPLE_APFLG) && HostFeatures.SupportsFlagM;
+#endif
+
   HandleErrata(&HostFeatures, MIDR);
   OverrideFeatures(&HostFeatures, ForceSVEWidth());
+
+#if defined(ARCHITECTURE_arm64) && !defined(_WIN32) && !defined(VIXL_SIMULATOR)
+  if (HostFeatures.SupportsAPFLG && !HostFeatures.IsInstCountCI) {
+    constexpr int PR_AURORA_SET_X86_FLAGS = 0x41555006;
+    if (prctl(PR_AURORA_SET_X86_FLAGS, 1, 0, 0, 0) != 0 && (getauxval(AT_HWCAP3_) & HWCAP3_APPLE_APFLG)) {
+      // Advertised but refused: run without it rather than with wrong PF/AF.
+      HostFeatures.SupportsAPFLG = false;
+    }
+  }
+#endif
 }
 
-FEXCore::HostFeatures FetchHostFeatures() {
+#ifndef _WIN32
+namespace TPIDRRO {
+  bool SupportsTPIDRRO_CPU() {
+    // 1 means supports, anything else is unsupported.
+    return prctl(PR_GET_TPIDRRO_CPU, 0, 0, 0, 0) == 1;
+  }
+} // namespace TPIDRRO
+#endif
+
+FEXCore::HostFeatures FetchHostFeatures(bool Is64BitMode) {
   FEX_CONFIG_OPT(CPUFeatureRegisters, CPUFEATUREREGISTERS);
 
   CPUFeatures Features {};
@@ -627,13 +666,21 @@ FEXCore::HostFeatures FetchHostFeatures() {
   __asm volatile("mrs %[midr], midr_el1" : [midr] "=r"(MIDR));
 #endif
 
-  FEXCore::HostFeatures HostFeatures = {};
+  FEXCore::HostFeatures HostFeatures = {
+#ifndef _WIN32
+    // Wine/Windows side sets this elsewhere.
+    .SupportsCPUIndexInTPIDRRO = TPIDRRO::SupportsTPIDRRO_CPU(),
+#endif
+    .ProcessFeatures =
+      {
+        .HostType = FEXCore::HostFeatures::HostTypeEnum::Linux,
+        // Fault free syncronous faults unsupported on Linux for now.
+        .SupportsFaultFreeSynchronousFaults = false,
+        .Is64BitMode = Is64BitMode,
+      },
+    .ProcessPID = static_cast<uint32_t>(::getpid())};
   FillMIDRInformationViaLinux(&HostFeatures);
   FetchHostFeatures(Features, HostFeatures, true, CTR, MIDR);
-
-  HostFeatures.SupportsCPUIndexInTPIDRRO = false;
-  HostFeatures.HostType = FEXCore::HostFeatures::HostTypeEnum::Linux;
-  HostFeatures.ProcessPID = ::getpid();
   return HostFeatures;
 }
 } // namespace FEX
