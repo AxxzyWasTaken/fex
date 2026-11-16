@@ -592,7 +592,9 @@ int main(int argc, char** argv, char** const envp) {
   if (FEX::Logging::OutputFD > 2) {
     SyscallHandler->FM.TrackFEXFD(FEX::Logging::OutputFD);
   }
-  SyscallHandler->FM.TrackFEXFD(FEXServerClient::GetServerFD());
+  if (FEXServerClient::GetServerFD() != -1) {
+    SyscallHandler->FM.TrackFEXFD(FEXServerClient::GetServerFD());
+  }
   if (FEX::Logging::FEXServer::FEXServerFD != -1) {
     SyscallHandler->FM.TrackFEXFD(FEX::Logging::FEXServer::FEXServerFD);
   }
@@ -632,8 +634,10 @@ int main(int argc, char** argv, char** const envp) {
   SyscallHandler->DefaultProgramBreak(BRKInfo.Base, BRKInfo.Size);
 
   if (FEXCore::Config::Get_ENABLECODECACHINGWIP()) {
-    // Request code cache generation
-    FEXServerClient::PopulateCodeCache(FEXServerClient::GetServerFD(), Loader.GetMainElfFD(), FEXCore::Config::Get_MULTIBLOCK());
+    // Request code cache generation, from the FEXServer if there is one
+    if (FEXServerClient::GetServerFD() != -1) {
+      FEXServerClient::PopulateCodeCache(FEXServerClient::GetServerFD(), Loader.GetMainElfFD(), FEXCore::Config::Get_MULTIBLOCK());
+    }
 
     if (VDSOMapping) {
       // Finalize code cache for libVDSO-guest.so. This needs to be done explicitly since VDSO doesn't use LoadLib.
