@@ -293,6 +293,12 @@ int StartServer(std::string_view InterpreterPath, int watch_fd) {
   sigaction(SIGCHLD, &action, &action);
 
   pid_t pid = fork();
+  if (pid == -1) {
+    close(fds[0]);
+    close(fds[1]);
+    sigaction(SIGCHLD, &action, nullptr);
+    return -1;
+  }
   if (pid == 0) {
     // Child
     close(fds[0]); // Close read end of pipe
@@ -346,6 +352,7 @@ int StartServer(std::string_view InterpreterPath, int watch_fd) {
     ssize_t bytes_read = read(fds[0], &error, sizeof(error));
     close(fds[0]);
     if (bytes_read > 0 && error != 0) {
+      sigaction(SIGCHLD, &action, nullptr);
       return -1;
     }
 
