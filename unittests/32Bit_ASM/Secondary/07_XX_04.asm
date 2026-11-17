@@ -25,7 +25,7 @@ mov esp, 0x41424344
 mov ebp, 0x41424344
 
 smsw eax
-smsw bx
+o16 smsw bx
 
 smsw [esi]
 mov ecx, [esi]
