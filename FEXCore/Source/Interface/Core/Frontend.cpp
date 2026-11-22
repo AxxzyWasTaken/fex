@@ -89,6 +89,12 @@ Decoder::Decoder(FEXCore::Core::InternalThreadState* Thread)
 }
 
 int32_t Decoder::CheckRangeExecutable(uint64_t Address, uint64_t Size) {
+  // The instruction already hit a non-executable byte and is rolled back. Its later bytes stay non-executable even if
+  // the frontend has learnt their range since, or the instruction would partially decode past a byte that faulted.
+  if (HitNonExecutableRange) {
+    return 0;
+  }
+
   // Check for wraparound
   if (Address + Size < Address) {
     // Say that any bytes that wrapped around are unreadable
@@ -166,10 +172,6 @@ std::pair<uint64_t, bool> Decoder::ReadData(uint8_t Size) {
   auto ReadableSize = CheckRangeExecutable(Address, Size);
   if (ReadableSize == Size) {
     std::memcpy(&Res, &InstStream.AdjustedInstStream[InstructionSize], Size);
-  } else {
-    HitNonExecutableRange = true;
-    // See PeekByte, this specific case may cause some executable memory to read as 0 but it doesn't matter as the entire instruction will be rolled back anyway.
-    Res = 0;
   }
 
   // Skip the number of decoded bytes regardless to get instruction size.
@@ -181,6 +183,12 @@ std::pair<uint64_t, bool> Decoder::ReadData(uint8_t Size) {
 #else
   SkipBytes(std::abs(ReadableSize));
 #endif
+
+  if (ReadableSize != Size) {
+    // Set after the skip above, which reads the executable part again. Res stays 0: see PeekByte, this specific case
+    // may cause some executable memory to read as 0 but it doesn't matter as the entire instruction will be rolled back anyway.
+    HitNonExecutableRange = true;
+  }
 
   if (Relocations) {
     uint32_t SectionOffset = static_cast<uint32_t>(Address - SectionMinAddress);
@@ -1642,6 +1650,8 @@ void Decoder::DecodeLoop(const uint8_t* _InstStream, uint64_t GuestSizePause) {
 
     while (1) {
       InstructionSize = 0;
+      // The peeks below run before DecodeInstruction resets this, so the last block's NoExec must not leak into them.
+      HitNonExecutableRange = false;
 
       // MAX_INST_SIZE assumes worst case
       auto OpAddress = BlockIt->Entry + PCOffset;
