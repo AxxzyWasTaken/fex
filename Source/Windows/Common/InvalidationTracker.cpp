@@ -73,6 +73,8 @@ bool InvalidationTracker::InsertIfExecutableLocked(FEXCore::IntervalList<uint64_
   }
   if (DEPDisabled && !HasExec) {
     DEPPromotedIntervals.Insert(ProtInterval);
+  } else {
+    DEPPromotedIntervals.Remove(ProtInterval);
   }
   return true;
 }
@@ -219,6 +221,7 @@ InvalidationTracker::InvalidateContainingSectionResult InvalidationTracker::Inva
     XIntervals.Remove({SectionBase, SectionBase + SectionSize});
     RWXIntervals.Remove({SectionBase, SectionBase + SectionSize});
     InlineSMCIntervals.Remove({SectionBase, SectionBase + SectionSize});
+    DEPPromotedIntervals.Remove({SectionBase, SectionBase + SectionSize});
     UnmappingSection = {SectionBase, SectionBase + SectionSize};
   }
   InvalidateIntervalInternalLocked(SectionBase, SectionSize);
@@ -256,6 +259,7 @@ void InvalidationTracker::InvalidateAlignedInterval(uint64_t Address, uint64_t S
     XIntervals.Remove({AlignedBase, AlignedBase + AlignedSize});
     RWXIntervals.Remove({AlignedBase, AlignedBase + AlignedSize});
     InlineSMCIntervals.Remove({AlignedBase, AlignedBase + AlignedSize});
+    DEPPromotedIntervals.Remove({AlignedBase, AlignedBase + AlignedSize});
   }
   InvalidateIntervalInternalLocked(AlignedBase, AlignedSize);
 }
