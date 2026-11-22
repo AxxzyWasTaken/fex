@@ -940,7 +940,7 @@ uintptr_t ContextImpl::CompileBlockLocked(FEXCore::Core::CpuStateFrame* Frame, u
     return HostCode;
   }
 
-  Thread->FrontendDecoder->SetupDecodeInstructionsAtEntry(Thread, GuestRIP, MaxInst);
+  Thread->FrontendDecoder->SetupDecodeInstructionsAtEntry(Thread, GuestRIP, MaxInst, true);
 
   std::optional<ExecutableFileSectionInfo> Region = SyscallHandler->LookupExecutableFileSection(Thread, GuestRIP);
   std::optional<DiskCache::CodeHitData> Hit;
@@ -952,9 +952,11 @@ uintptr_t ContextImpl::CompileBlockLocked(FEXCore::Core::CpuStateFrame* Frame, u
       auto LoadedCode = Thread->CPUBackend->LoadCachedCode(Hit->HostCode);
       if (LoadedCode.BlockBegin) {
         for (auto& CodePage : Hit->GuestPages) {
-          if (Thread->LookupCache->AddBlockExecutableRange(Thread, Hit->EntryPointRIPs, CodePage, FEXCore::Utils::FEX_PAGE_SIZE)) {
+          // Protect before the page is recorded: a decoder that finds code on a page takes it as protected
+          if (!Thread->LookupCache->HasCodePage(CodePage)) {
             SyscallHandler->MarkGuestExecutableRange(Thread, CodePage, FEXCore::Utils::FEX_PAGE_SIZE);
           }
+          Thread->LookupCache->AddBlockExecutableRange(Thread, Hit->EntryPointRIPs, CodePage, FEXCore::Utils::FEX_PAGE_SIZE);
         }
 
         LOGMAN_THROW_A_FMT(Hit->EntryPointRIPs.size() == Hit->EntryPointHostOffsets.size(), "Mismatched Disk Cache entrypoint pairs!");
@@ -1042,15 +1044,13 @@ uintptr_t ContextImpl::CompileBlockLocked(FEXCore::Core::CpuStateFrame* Frame, u
   fextl::vector<uint64_t> CodePages;
 
   if (NeedsAddGuestCodeRanges) {
-    // Track in the guest to host map all entrypoints for all pages the compiled block touches, if any page didn't previously
-    // contain code, inform the frontend so it can setup SMC detection.
+    // Track in the guest to host map all entrypoints for all pages the compiled block touches. The decoder already set up SMC
+    // detection for the pages that had no code.
     auto BlockInfo = Thread->FrontendDecoder->GetDecodedBlockInfo();
     CodePages.reserve(BlockInfo->CodePages.size());
     CodePages.insert(CodePages.end(), BlockInfo->CodePages.begin(), BlockInfo->CodePages.end());
     for (auto CodePage : BlockInfo->CodePages) {
-      if (Thread->LookupCache->AddBlockExecutableRange(Thread, BlockInfo->EntryPoints, CodePage, FEXCore::Utils::FEX_PAGE_SIZE)) {
-        SyscallHandler->MarkGuestExecutableRange(Thread, CodePage, FEXCore::Utils::FEX_PAGE_SIZE);
-      }
+      Thread->LookupCache->AddBlockExecutableRange(Thread, BlockInfo->EntryPoints, CodePage, FEXCore::Utils::FEX_PAGE_SIZE);
     }
   }
 

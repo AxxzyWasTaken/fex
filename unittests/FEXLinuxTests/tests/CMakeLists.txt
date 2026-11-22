@@ -45,6 +45,8 @@ target_link_libraries(smc-mt-1.${BITNESS} PRIVATE pthread)
 
 target_link_libraries(smc-mt-2.${BITNESS} PRIVATE pthread)
 
+target_link_libraries(smc-mt-3.${BITNESS} PRIVATE pthread)
+
 target_link_libraries(smc-shared-1.${BITNESS} PRIVATE rt pthread)
 
 target_link_libraries(smc-shared-2.${BITNESS} PRIVATE rt pthread)

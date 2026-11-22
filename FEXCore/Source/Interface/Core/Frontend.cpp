@@ -1666,17 +1666,17 @@ void Decoder::DecodeLoop(const uint8_t* _InstStream, uint64_t GuestSizePause) {
       if (!EntryBlock && OpMinPage == OpMaxPage && PeekByte(0).value_or(0) == 0 && PeekByte(1).value_or(0) == 0) [[unlikely]] {
         // End the multiblock early if we hit 2 consecutive null bytes (add [rax], al) in the same page with the
         // assumption we are most likely trying to explore garbage code.
+        // Nothing is translated from these bytes, so their page doesn't need to be added (and protected) first.
         break;
       }
 
+      // Before any byte of the instruction is read
       if (OpMinPage != CurrentCodePage) {
-        CurrentCodePage = OpMinPage;
-        BlockInfo.CodePages.insert(CurrentCodePage);
+        AddCodePage(OpMinPage);
       }
 
       if (OpMaxPage != CurrentCodePage) {
-        CurrentCodePage = OpMaxPage;
-        BlockInfo.CodePages.insert(CurrentCodePage);
+        AddCodePage(OpMaxPage);
       }
 
       LastFieldReadSize = 0;
@@ -1820,7 +1820,18 @@ void Decoder::DecodeLoop(const uint8_t* _InstStream, uint64_t GuestSizePause) {
   }
 }
 
-void Decoder::SetupDecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thread, uint64_t PC, uint64_t MaxInst) {
+void Decoder::AddCodePage(uint64_t Page) {
+  CurrentCodePage = Page;
+  if (BlockInfo.CodePages.insert(Page).second && ProtectCodePages && !Thread->LookupCache->HasCodePage(Page)) {
+    // Protect the page before reading it, not after compiling: a write between the two would not fault, and the block would keep
+    // the old code. A write after this faults, and its invalidation waits for the compile to finish (CodeInvalidationMutex).
+    // If the decode produces no block, the page stays protected without code: the next compile protects it again, and a write
+    // takes one extra fault.
+    CTX->SyscallHandler->MarkGuestExecutableRange(Thread, Page, FEXCore::Utils::FEX_PAGE_SIZE);
+  }
+}
+
+void Decoder::SetupDecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thread, uint64_t PC, uint64_t MaxInst, bool Protect) {
   FEXCORE_PROFILE_SCOPED("DecodeInstructions");
   BlockInfo.TotalInstructionCount = 0;
   BlockInfo.Blocks.clear();
@@ -1869,9 +1880,9 @@ void Decoder::SetupDecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState*
   // Entry is a jump target
   BlocksToDecode = {PC};
 
-  CurrentCodePage = PC & FEXCore::Utils::FEX_PAGE_MASK;
-
-  BlockInfo.CodePages = {CurrentCodePage};
+  ProtectCodePages = Protect;
+  BlockInfo.CodePages.clear();
+  AddCodePage(PC & FEXCore::Utils::FEX_PAGE_MASK);
 
   EntryBlock = true;
   FinalInstruction = false;

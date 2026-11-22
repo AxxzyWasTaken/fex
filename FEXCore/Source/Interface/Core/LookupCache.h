@@ -105,6 +105,11 @@ struct GuestToHostMap {
       .first->second;
   }
 
+  bool HasCodePage(uint64_t Address, const LookupCacheReadLockToken&) const {
+    auto It = CodePages.find(Address >> 12);
+    return It != CodePages.end() && !It->second.empty();
+  }
+
   const BlockEntry* FindBlock(uint64_t Address, const LookupCacheReadLockToken&) {
     auto HostCode = BlockList.find(Address);
     if (HostCode == BlockList.end()) {
@@ -286,6 +291,12 @@ public:
   }
 
   GuestToHostMap* Shared = nullptr;
+
+  // Whether a block was compiled from the guest page containing Address
+  bool HasCodePage(uint64_t Address) {
+    auto lk = Shared->AcquireReadLock();
+    return Shared->HasCodePage(Address, lk);
+  }
 
   // Appends a list of Block {Address} to CodePages [Start, Start + Length)
   // Returns true if new pages are marked as containing code
