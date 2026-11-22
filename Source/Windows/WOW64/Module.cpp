@@ -997,6 +997,7 @@ void BTCpuNotifyUnmapViewOfSection(void* Address, BOOL After, ULONG Status) {
       HandleImageUnmap(Start, Size);
     }
   } else {
+    InvalidationTracker->EndSectionUnmap();
     ThreadCreationMutex.unlock();
   }
 }
