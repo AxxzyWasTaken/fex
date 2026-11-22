@@ -215,34 +215,34 @@ public:
     ++IdleWaitRefCount;
   }
 
-  void InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState* CallingThread, uint64_t Start, uint64_t Length) {
+  // Runs Fn with no code being compiled, passing it a function that invalidates the code of one guest range. Ranges invalidated
+  // in one call can't get new code until Fn returns.
+  void InvalidateGuestCodeRanges(FEXCore::Core::InternalThreadState* CallingThread, auto&& Fn) {
     std::lock_guard lk(ThreadCreationMutex);
 
     // Potential deferred since Thread might not be valid.
     // Thread object isn't valid very early in frontend's initialization.
     // To be more optimal the frontend should provide this code with a valid Thread object earlier.
     auto CodeInvalidationlk = FEXCore::GuardSignalDeferringSectionWithFallback(CTX->GetCodeInvalidationMutex(), CallingThread);
-    CTX->InvalidateCodeBuffersCodeRange(Start, Length);
-    for (auto& Thread : Threads) {
-      CTX->InvalidateThreadCachedCodeRange(Thread->Thread, Start, Length);
-    }
+    Fn([this](uint64_t Start, uint64_t Length) {
+      CTX->InvalidateCodeBuffersCodeRange(Start, Length);
+      for (auto& Thread : Threads) {
+        CTX->InvalidateThreadCachedCodeRange(Thread->Thread, Start, Length);
+      }
+    });
+  }
+
+  void InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState* CallingThread, uint64_t Start, uint64_t Length) {
+    InvalidateGuestCodeRanges(CallingThread, [&](auto&& Invalidate) { Invalidate(Start, Length); });
   }
 
   void InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState* CallingThread, uint64_t Start, uint64_t Length,
                                 FEXCore::Context::CodeRangeInvalidationFn after_callback) {
-    std::lock_guard lk(ThreadCreationMutex);
-
-    // Potential deferred since Thread might not be valid.
-    // Thread object isn't valid very early in frontend's initialization.
-    // To be more optimal the frontend should provide this code with a valid Thread object earlier.
-    auto CodeInvalidationlk = FEXCore::GuardSignalDeferringSectionWithFallback(CTX->GetCodeInvalidationMutex(), CallingThread);
-    CTX->InvalidateCodeBuffersCodeRange(Start, Length);
-    for (auto& Thread : Threads) {
-      CTX->InvalidateThreadCachedCodeRange(Thread->Thread, Start, Length);
-    }
-
-    // Callback while holding the locks.
-    after_callback(Start, Length);
+    InvalidateGuestCodeRanges(CallingThread, [&](auto&& Invalidate) {
+      Invalidate(Start, Length);
+      // Callback while holding the locks.
+      after_callback(Start, Length);
+    });
   }
 
   const fextl::vector<FEX::HLE::ThreadStateObject*>* GetThreads() const {

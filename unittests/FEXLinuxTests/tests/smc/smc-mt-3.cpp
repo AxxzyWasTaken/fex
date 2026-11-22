@@ -51,3 +51,33 @@ TEST_CASE("SMC: private_rwx") {
   CHECK(RewriteWhileRunning(code, code) == 0);
   munmap(code, 4096);
 }
+
+// Runs from one view of a memfd and writes through an RW view of it. The code view is placed both below and above the RW view,
+// because the old per-view invalidation walked the views in address order and depended on it.
+static void CodeAndRWViews(int code_prot) {
+  int fd = memfd_create("smc-mt-3", 0);
+  REQUIRE(fd >= 0);
+  REQUIRE(ftruncate(fd, 4096) == 0);
+
+  for (const bool code_below : {true, false}) {
+    auto area = (char*)mmap(0, 8192, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    REQUIRE(area != MAP_FAILED);
+    auto code = (char*)mmap(area + (code_below ? 0 : 4096), 4096, code_prot, MAP_SHARED | MAP_FIXED, fd, 0);
+    auto rw = (char*)mmap(area + (code_below ? 4096 : 0), 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0);
+    REQUIRE(code != MAP_FAILED);
+    REQUIRE(rw != MAP_FAILED);
+    INFO("code view below RW view: " << code_below);
+    CHECK(RewriteWhileRunning(code, rw) == 0);
+    munmap(area, 8192);
+  }
+  close(fd);
+}
+
+TEST_CASE("SMC: memfd_rx_and_rw_views") {
+  CodeAndRWViews(PROT_READ | PROT_EXEC);
+}
+
+// The code view is writable too: unprotecting the writable views before invalidating the others would not be enough
+TEST_CASE("SMC: memfd_rwx_and_rw_views") {
+  CodeAndRWViews(PROT_READ | PROT_WRITE | PROT_EXEC);
+}
