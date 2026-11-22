@@ -2,6 +2,7 @@
 
 #include "Common/CPUInfo.h"
 
+#include <FEXCore/Config/Config.h>
 #include <FEXCore/Core/Context.h>
 #include <FEXCore/Core/HostFeatures.h>
 #include <FEXCore/fextl/fmt.h>
@@ -83,6 +84,14 @@ FEXCore::HostFeatures CPUFeatures::FetchHostFeatures(bool IsWine, FEXCore::HostF
   HostFeatures.ProcessFeatures.SupportsSVE256 = false;
 
   HostFeatures.SupportsCPUIndexInTPIDRRO = !IsWine || FEX::Windows::UnixLib::SupportsTPIDRRO_CPU();
+
+  FEX_CONFIG_OPT(HostFeaturesOpt, HOSTFEATURES);
+  const bool DisableAPFLG = (HostFeaturesOpt() & FEXCore::Config::HostFeatures::DISABLEAPFLG) != 0;
+  if (IsWine && !DisableAPFLG && HostFeatures.SupportsFlagM && FEX::Windows::UnixLib::TryEnableAPFLG()) {
+    HostFeatures.SupportsAPFLG = true;
+  } else {
+    HostFeatures.SupportsAPFLG = false;
+  }
 
   HostFeatures.ProcessPID = ProcessPID;
 

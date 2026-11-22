@@ -13,6 +13,7 @@ enum class FEXUnixLibFunctions : uint32_t {
   MapFile,
   GetPID,
   CheckSupportsTPIDRRO_CPU,
+  EnableAPFLG,
   MAX,
 };
 

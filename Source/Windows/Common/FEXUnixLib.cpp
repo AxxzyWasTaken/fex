@@ -221,4 +221,12 @@ bool SupportsTPIDRRO_CPU() {
   return false;
 }
 
+bool TryEnableAPFLG() {
+  if (!Available()) {
+    return false;
+  }
+
+  return Call(FEXUnixLibFunctions::EnableAPFLG, nullptr) == STATUS_SUCCESS;
+}
+
 } // namespace FEX::Windows::UnixLib
