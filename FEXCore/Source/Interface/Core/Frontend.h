@@ -67,7 +67,9 @@ public:
   Decoder(FEXCore::Core::InternalThreadState* Thread);
   bool CheckIfCacheable(FEXCore::Core::InternalThreadState&, const uint8_t* InstStream, uint64_t PC, uint64_t MaxInst);
 
-  void SetupDecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thread, uint64_t PC, uint64_t MaxInst);
+  // Protect: write-protect each page the block decodes from before reading it, for blocks whose pages get added to the
+  // lookup cache.
+  void SetupDecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thread, uint64_t PC, uint64_t MaxInst, bool Protect = false);
   void DecodeLoop(const uint8_t* InstStream, uint64_t GuestPause = 0);
 
   const DecodedBlockInformation* GetDecodedBlockInfo() const {
@@ -124,6 +126,8 @@ private:
   // Negative: Number of bytes that failed to decode.
   int32_t CheckRangeExecutable(uint64_t Address, uint64_t Size);
 
+  void AddCodePage(uint64_t Page);
+
   uint8_t ReadByte();
   std::optional<uint8_t> PeekByte(uint8_t Offset);
   std::pair<uint64_t, bool> ReadData(uint8_t Size);
@@ -143,6 +147,7 @@ private:
   size_t DecodedSize {};
   uint64_t TotalInstructions {};
   uint64_t CurrentCodePage {};
+  bool ProtectCodePages {};
   bool EntryBlock {};
   bool FinalInstruction {};
   uint64_t MaxInst {};

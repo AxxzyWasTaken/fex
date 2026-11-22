@@ -95,21 +95,26 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
 
       auto Offset = FaultBase - Entry->first + Entry->second.Offset;
 
-      auto VMA = Entry->second.Resource->FirstVMA;
-      LOGMAN_THROW_A_FMT(VMA, "VMA tracking error");
+      LOGMAN_THROW_A_FMT(Entry->second.Resource->FirstVMA, "VMA tracking error");
 
-      // Flush all mirrors, remap the page writable as needed
-      do {
-        if (VMA->Offset <= Offset && (VMA->Offset + VMA->Length) > Offset) {
-          auto FaultBaseMirrored = Offset - VMA->Offset + VMA->Base;
-
-          if (VMA->Prot.Writable) {
-            _SyscallHandler->TM.InvalidateGuestCodeRange(Thread, FaultBaseMirrored, FEXCore::Utils::FEX_PAGE_SIZE, UnprotectRegionCallback);
-          } else {
-            _SyscallHandler->TM.InvalidateGuestCodeRange(Thread, FaultBaseMirrored, FEXCore::Utils::FEX_PAGE_SIZE);
+      // Flush all mirrors, then remap the page writable in the writable ones, all without code being compiled in between.
+      // Otherwise a thread could translate the page again from a mirror that is already flushed, while the writable mirrors are
+      // still protected, and keep that translation once they are unprotected: the writes that follow wouldn't fault.
+      _SyscallHandler->TM.InvalidateGuestCodeRanges(Thread, [&](auto&& Invalidate) {
+        for (const bool Unprotect : {false, true}) {
+          for (auto VMA = Entry->second.Resource->FirstVMA; VMA; VMA = VMA->ResourceNextVMA) {
+            if (VMA->Offset > Offset || VMA->Offset + VMA->Length <= Offset) {
+              continue;
+            }
+            const auto FaultBaseMirrored = Offset - VMA->Offset + VMA->Base;
+            if (!Unprotect) {
+              Invalidate(FaultBaseMirrored, FEXCore::Utils::FEX_PAGE_SIZE);
+            } else if (VMA->Prot.Writable) {
+              UnprotectRegionCallback(FaultBaseMirrored, FEXCore::Utils::FEX_PAGE_SIZE);
+            }
           }
         }
-      } while ((VMA = VMA->ResourceNextVMA));
+      });
     } else {
       _SyscallHandler->TM.InvalidateGuestCodeRange(Thread, FaultBase, FEXCore::Utils::FEX_PAGE_SIZE, UnprotectRegionCallback);
     }
