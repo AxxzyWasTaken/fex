@@ -231,6 +231,10 @@ struct alignas(64) CPUState {
   // Debug register 7 is the control register.
   uint64_t Dr7 {};
 
+  // Reserved exclusively for REPE/REPNE CMPS to carry Src1/Src2 across the
+  // loop/post-loop boundary when PF/AF registers are unavailable under APFLG.
+  uint64_t CmpsLoopOperands[2] {};
+
   // PF/AF are statically mapped as-if they were r16/r17 (which do not exist in
   // x86 otherwise). This allows a straightforward mapping for SRA.
   static constexpr uint8_t PF_AS_GREG = 16;
@@ -303,6 +307,7 @@ static_assert((offsetof(CPUState, pf_raw) + 4) == offsetof(CPUState, af_raw), "p
 // Some CPU architectures have a penalty for alignment of ldp/stp not being 2 * <element_size>.
 static_assert(offsetof(CPUState, gregs[0]) % 16 == 0, "gregs should be 16-byte aligned");
 static_assert(offsetof(CPUState, pf_raw) % 8 == 0, "pf_raw must be 8-byte aligned.");
+static_assert(offsetof(CPUState, CmpsLoopOperands[1]) <= 4095, "CmpsLoopOperands must fit 12-bit unsigned byte offset");
 
 struct InternalThreadState;
 
