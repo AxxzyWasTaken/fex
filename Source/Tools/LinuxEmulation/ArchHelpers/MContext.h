@@ -46,6 +46,7 @@ struct X86ContextBackup {
   int Signal;
   uint32_t Flags;
   uint64_t OriginalRIP;
+  uint32_t OriginalEFLAGS;
   uint64_t FPStateLocation;
   uint64_t UContextLocation;
   uint64_t SigInfoLocation;
@@ -73,6 +74,7 @@ struct ArmContextBackup {
   int Signal;
   uint32_t Flags;
   uint64_t OriginalRIP;
+  uint32_t OriginalEFLAGS;
   uint64_t FPStateLocation;
   uint64_t UContextLocation;
   uint64_t SigInfoLocation;
@@ -153,6 +155,10 @@ static inline uint64_t GetArmReg(void* ucontext, uint32_t id) {
 
 static inline uint64_t GetArmPState(void* ucontext) {
   return GetMContext(ucontext)->pstate;
+}
+
+static inline void SetArmPState(void* ucontext, uint64_t val) {
+  GetMContext(ucontext)->pstate = val;
 }
 
 static inline uint64_t* GetArmGPRs(void* ucontext) {

@@ -369,6 +369,27 @@ void ContextImpl::SetFlagsFromCompactedEFLAGS(FEXCore::Core::InternalThreadState
   Frame->State.flags[X86State::RFLAG_IF_LOC] = 1;
 }
 
+uint64_t ContextImpl::FlipHostEFLAGS(uint32_t ChangedEFLAGS, uint64_t* HostGPRs, uint64_t PSTATE) {
+  const auto Changed = [ChangedEFLAGS](unsigned Flag) -> uint64_t {
+    return (ChangedEFLAGS >> Flag) & 1;
+  };
+
+  for (unsigned Flag : {X86State::RFLAG_CF_RAW_LOC, X86State::RFLAG_ZF_RAW_LOC, X86State::RFLAG_SF_RAW_LOC, X86State::RFLAG_OF_RAW_LOC}) {
+    PSTATE ^= Changed(Flag) << IR::OpDispatchBuilder::IndexNZCV(Flag);
+  }
+
+  if (HostFeatures.SupportsAPFLG) {
+    PSTATE ^= Changed(X86State::RFLAG_PF_RAW_LOC) << IR::OpDispatchBuilder::APFLG_PF_BIT;
+    PSTATE ^= Changed(X86State::RFLAG_AF_RAW_LOC) << IR::OpDispatchBuilder::APFLG_AF_BIT;
+  } else {
+    // PF is the inverted parity of the low byte of REG_PF, AF is bit 4 of REG_AF ^ REG_PF.
+    HostGPRs[CPU::REG_PF.Idx()] ^= Changed(X86State::RFLAG_PF_RAW_LOC);
+    HostGPRs[CPU::REG_AF.Idx()] ^= Changed(X86State::RFLAG_AF_RAW_LOC) << 4;
+  }
+
+  return PSTATE;
+}
+
 bool ContextImpl::InitCore() {
   if (CodeCache.IsGeneratingCache || FEXCore::Config::Get_ENABLECODECACHINGWIP()) {
     // Start with a larger code buffer to avoid resizes that would discard code
