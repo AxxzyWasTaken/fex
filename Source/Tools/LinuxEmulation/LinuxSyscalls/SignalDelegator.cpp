@@ -317,8 +317,9 @@ void SignalDelegator::RestoreThreadState(FEXCore::Core::InternalThreadState* Thr
       ArchHelpers::Context::SetFillSRASingleInst(ucontext, false);
       // Set our state register to point to our guest thread data
       ArchHelpers::Context::SetState(ucontext, reinterpret_cast<uint64_t>(Frame));
-    } else if (Context->Flags & ArchHelpers::Context::ContextFlags::CONTEXT_FLAG_INJIT) {
-      // The interrupted JIT code resumes with the static registers it holds in host registers, put the frame's values there.
+    } else if (Context->Flags &
+               (ArchHelpers::Context::ContextFlags::CONTEXT_FLAG_INJIT | ArchHelpers::Context::ContextFlags::CONTEXT_FLAG_INDISPATCHER)) {
+      // The interrupted code resumes with the static registers it holds in host registers, put the frame's values there.
       // Flags only get the handler's changes: the JIT may hold them in a different form at this point.
       const uint32_t ChangedEFLAGS = Context->OriginalEFLAGS ^ CTX->ReconstructCompactedEFLAGS(Thread, false, nullptr, 0);
       FillSRA(Thread, ucontext, Context->InSyscallInfo & 0xFFFF, ChangedEFLAGS);
@@ -361,17 +362,9 @@ bool SignalDelegator::HandleDispatcherGuestSignal(FEXCore::Core::InternalThreadS
     SpillSRA(Thread, ucontext, IgnoreMask);
 
     ContextBackup->Flags |= ArchHelpers::Context::ContextFlags::CONTEXT_FLAG_INJIT;
-  } else {
-    if (!IsAddressInDispatcher(OldPC)) {
-      // This is likely to cause issues but in some cases it isn't fatal
-      // This can also happen if we have put a signal on hold, then we just reenabled the signal
-      // So we are in the syscall handler
-      // Only throw a log message in this case
-      if constexpr (false) {
-        // XXX: Messages in the signal handler can cause us to crash
-        LogMan::Msg::EFmt("Signals in dispatcher have unsynchronized context");
-      }
-    }
+  } else if (IsAddressInDispatcher(OldPC)) {
+    // Signals only arrive at points where the dispatcher holds the guest state in both the frame and the static registers.
+    ContextBackup->Flags |= ArchHelpers::Context::ContextFlags::CONTEXT_FLAG_INDISPATCHER;
   }
 
   // The guest handler isn't in a syscall, even when the signal arrived in the syscall handler. StoreThreadState saved the
@@ -660,6 +653,13 @@ void SignalDelegator::HandleGuestSignal(FEX::HLE::ThreadStateObject* ThreadObjec
   auto SigInfo = *static_cast<siginfo_t*>(Info);
 
   auto MustDeferSignal = (Thread->CurrentFrame->State.DeferredSignalRefCount.Load() != 0);
+
+  // JIT and dispatcher code is only at a guest instruction boundary at its pending interrupt checks, and between them it
+  // can hold guest state the frame can't show, like a register mid-update or an address computed from one. Wait for the next
+  // check, so the guest handler sees and changes exact state. Not while the thread is marked as in a syscall: that state is
+  // exact as well, and a blocking syscall must be interrupted.
+  const auto PC = ArchHelpers::Context::GetPc(UContext);
+  const bool BetweenChecks = (CTX->IsAddressInCodeBuffer(Thread, PC) || IsAddressInDispatcher(PC)) && Thread->CurrentFrame->InSyscallInfo == 0;
   if (Signal == SIGSEGV && SigInfo.si_code == SEGV_ACCERR && SigInfo.si_addr == reinterpret_cast<void*>(&Thread->InterruptFaultPage)) {
     if (!MustDeferSignal) {
       // We just reached the end of the outermost signal-deferring section and faulted to check for pending signals.
@@ -701,7 +701,7 @@ void SignalDelegator::HandleGuestSignal(FEX::HLE::ThreadStateObject* ThreadObjec
       ERROR_AND_DIE_FMT("X86 shouldn't hit this InterruptFaultPage");
 #endif
     }
-  } else if (IsAsyncSignal(&SigInfo, Signal) && MustDeferSignal) {
+  } else if (IsAsyncSignal(&SigInfo, Signal) && (MustDeferSignal || BetweenChecks)) {
     // If the signal is asynchronous (as determined by si_code) and FEX is in a state of needing
     // to defer the signal, then add the signal to the thread's signal queue.
     LOGMAN_THROW_A_FMT(ThreadObject->SignalInfo.DeferredSignalFrames.size() != ThreadObject->SignalInfo.DeferredSignalFrames.capacity(),

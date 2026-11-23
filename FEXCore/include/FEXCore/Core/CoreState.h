@@ -451,13 +451,15 @@ struct CpuStateFrame {
   uint64_t ReturningStackLocation {};
 
   /**
-   * @brief If we are in an inline syscall we need to store a bit of additional information about this
+   * @brief If we are in a syscall we need to store a bit of additional information about this
    *
+   * Nonzero while in a syscall or a host call, where signals are taken right away.
    * ARM64:
-   *  - Bit 15: In syscall
-   *  - Bit 14-0: Number of static registers spilled
+   *  - Bit 16: In a thunk call (IN_THUNK_CALL)
+   *  - Bit 15-0: Mask of the static registers already spilled, by host register index
    */
   uint64_t InSyscallInfo {};
+  static constexpr uint64_t IN_THUNK_CALL = 1ULL << 16;
 
   struct SynchronousFaultDataStruct {
     bool FaultToTopAndGeneratedException {};

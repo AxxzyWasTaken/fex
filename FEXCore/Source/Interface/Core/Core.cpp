@@ -396,16 +396,16 @@ bool ContextImpl::InitCore() {
     StartMaximalCodeBuffer();
   }
 
+  if (Config.GdbServer || SignalDelegation->NeedsPendingInterruptFaultCheck()) {
+    // gdbserver pauses threads at these checks, and the frontend may take signals there.
+    Config.NeedsPendingInterruptFaultCheck = true;
+  }
+
   // Initialize the CPU core signal handlers & DispatcherConfig
   Dispatcher = FEXCore::CPU::Dispatcher::Create(this);
 
   // Set up the SignalDelegator config since core is initialized.
   SignalDelegation->SetConfig(Dispatcher->MakeSignalDelegatorConfig());
-
-  if (Config.GdbServer) {
-    // If gdbserver is enabled then this needs to be enabled.
-    Config.NeedsPendingInterruptFaultCheck = true;
-  }
 
   if constexpr (BLOCK_DEBUGGING) {
     // If the developer wants to do any single-stepping points or watch points.

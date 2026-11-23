@@ -115,6 +115,11 @@ public:
     return reinterpret_cast<uintptr_t>(VDSOPointers.VDSO_FEX_CallbackRET);
   }
 
+  // Asynchronous signals that arrive in JIT or dispatcher code wait for the next check, see HandleGuestSignal.
+  bool NeedsPendingInterruptFaultCheck() const override {
+    return true;
+  }
+
   [[noreturn]]
   void HandleSignalHandlerReturn(bool RT) {
     using SignalHandlerReturnFunc = void (*)();
