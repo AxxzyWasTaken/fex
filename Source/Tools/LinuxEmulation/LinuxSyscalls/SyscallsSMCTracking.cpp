@@ -23,6 +23,7 @@ $end_info$
 #include "LinuxSyscalls/SignalDelegator.h"
 
 #include <FEXCore/Debug/InternalThreadState.h>
+#include <FEXCore/Utils/Allocator.h>
 #include <FEXCore/Utils/LogManager.h>
 #include <FEXCore/Utils/MathUtils.h>
 #include <FEXCore/Utils/SignalScopeGuards.h>
@@ -49,6 +50,14 @@ static void HandleSegfaultForCodeCacheFinalization(FEXCore::Core::InternalThread
 bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, int Signal, void* info, void* ucontext) {
   const auto FaultAddress = (uintptr_t)((siginfo_t*)info)->si_addr;
 
+  const auto InterruptFaultPage = reinterpret_cast<uintptr_t>(&Thread->InterruptFaultPage);
+  if (FaultAddress >= InterruptFaultPage && FaultAddress < InterruptFaultPage + sizeof(Thread->InterruptFaultPage)) {
+    // Deferred-signal InterruptFaultPage faults are handled by SignalDelegator::HandleGuestSignal.
+    // Return before touching VMATracking.Mutex, which this thread may already hold exclusively when
+    // a nested DeferredSignalRefCountGuard exits (e.g. OSAllocator_64Bit::Mmap inside GuestMmap).
+    return false;
+  }
+
   auto ThreadObject = FEX::HLE::ThreadManager::GetStateObjectFromFEXCoreThread(Thread);
   auto CallRetStackInfo = ThreadObject->GetCallRetStackInfo();
   if (FaultAddress >= CallRetStackInfo.AllocationBase && FaultAddress < CallRetStackInfo.AllocationEnd) {
@@ -60,6 +69,21 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
   {
     // Can't use the deferred signal lock in the SIGSEGV handler.
     auto lk = FEXCore::MaskSignalsAndLockMutex<std::shared_lock>(_SyscallHandler->VMATracking.Mutex);
+
+    // Signals are already masked above; clear the allocator's TLSThread while in SIGSEGV so any
+    // jemalloc -> OSAllocator_64Bit::{Mmap,Munmap} falls back to ScopedSignalMasker instead of
+    // DeferredSignalRefCountGuard (whose store to a PROT_NONE InterruptFaultPage would kill the
+    // process with SIGSEGV masked).
+    struct ScopedDisableAllocatorDeferredSignals {
+      FEXCore::Core::InternalThreadState* SavedThread;
+      explicit ScopedDisableAllocatorDeferredSignals(FEXCore::Core::InternalThreadState* T)
+        : SavedThread(T) {
+        FEXCore::Allocator::UninstallTLSData(SavedThread);
+      }
+      ~ScopedDisableAllocatorDeferredSignals() {
+        FEXCore::Allocator::RegisterTLSData(SavedThread);
+      }
+    } DisableAllocatorDeferredSignals(Thread);
 
     auto& VMATracking = _SyscallHandler->VMATracking;
 
@@ -100,7 +124,9 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
       // Flush all mirrors, then remap the page writable in the writable ones, all without code being compiled in between.
       // Otherwise a thread could translate the page again from a mirror that is already flushed, while the writable mirrors are
       // still protected, and keep that translation once they are unprotected: the writes that follow wouldn't fault.
-      _SyscallHandler->TM.InvalidateGuestCodeRanges(Thread, [&](auto&& Invalidate) {
+      // Pass nullptr for CallingThread: we are inside SIGSEGV with signals masked by lk above, so we must not use
+      // DeferredSignalRefCountGuard (whose store to a PROT_NONE InterruptFaultPage would kill the process with SIGSEGV masked).
+      _SyscallHandler->TM.InvalidateGuestCodeRanges(nullptr, [&](auto&& Invalidate) {
         for (const bool Unprotect : {false, true}) {
           for (auto VMA = Entry->second.Resource->FirstVMA; VMA; VMA = VMA->ResourceNextVMA) {
             if (VMA->Offset > Offset || VMA->Offset + VMA->Length <= Offset) {
@@ -116,7 +142,8 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
         }
       });
     } else {
-      _SyscallHandler->TM.InvalidateGuestCodeRange(Thread, FaultBase, FEXCore::Utils::FEX_PAGE_SIZE, UnprotectRegionCallback);
+      // Pass nullptr for CallingThread for the same reason as above (inside SIGSEGV with signals masked).
+      _SyscallHandler->TM.InvalidateGuestCodeRange(nullptr, FaultBase, FEXCore::Utils::FEX_PAGE_SIZE, UnprotectRegionCallback);
     }
 
     FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedSMCCount, 1);
