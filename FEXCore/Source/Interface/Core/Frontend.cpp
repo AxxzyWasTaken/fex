@@ -1393,6 +1393,7 @@ void Decoder::AddBranchTarget(uint64_t Target) {
           .NumInstructions = BlockIt->NumInstructions - SplitIdx,
           .DecodedInstructions = BlockIt->DecodedInstructions + SplitIdx,
           .BlockStatus = BlockIt->BlockStatus,
+          .ForceFullSMCDetection = BlockIt->ForceFullSMCDetection,
         };
 
         if (BlockIt->DataMasks.size()) {
