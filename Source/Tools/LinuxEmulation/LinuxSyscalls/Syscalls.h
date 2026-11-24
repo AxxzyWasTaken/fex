@@ -92,6 +92,8 @@ void RegisterStubs(FEX::HLE::SyscallHandler* Handler);
 
 uint64_t UnimplementedSyscall(FEXCore::Core::CpuStateFrame* Frame, uint64_t SyscallNumber);
 uint64_t UnimplementedSyscallSafe(FEXCore::Core::CpuStateFrame* Frame, uint64_t SyscallNumber);
+// ioctl on a userfaultfd (request type UFFDIO), for both guest ABIs.
+uint64_t UserfaultfdIoctl(int fd, uint32_t cmd, uint64_t arg);
 
 struct ExecveAtArgs {
   int dirfd;
@@ -288,6 +290,10 @@ public:
   ///// VMA (Virtual Memory Area) tracking /////
   static bool HandleSegfault(FEXCore::Core::InternalThreadState* Thread, int Signal, void* info, void* ucontext);
   void MarkGuestExecutableRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override;
+  // MarkGuestExecutableRange protects the writable views of shared memory that exist when code is compiled. A view mapped or made
+  // writable later (the RW half of a W^X double mapping, as .NET uses) must be protected where it aliases an executable view too,
+  // or writes through it never reach the code invalidation. Call with VMATracking.Mutex held, after tracking the change.
+  void ProtectNewWritableAliases(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length);
   void InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override;
   std::optional<FEXCore::ExecutableFileSectionInfo>
   LookupExecutableFileSection(FEXCore::Core::InternalThreadState* Thread, uint64_t GuestAddr) final override;

@@ -23,6 +23,7 @@ $end_info$
 #include <FEXCore/Utils/ArchHelpers/Arm64.h>
 #include <FEXHeaderUtils/Syscalls.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <csignal>
@@ -133,6 +134,34 @@ void SignalDelegator::SpillSRA(FEXCore::Core::InternalThreadState* Thread, void*
   uint32_t EFlags =
     CTX->ReconstructCompactedEFLAGS(Thread, true, ArchHelpers::Context::GetArmGPRs(ucontext), ArchHelpers::Context::GetArmPState(ucontext));
   CTX->SetFlagsFromCompactedEFLAGS(Thread, EFlags);
+#endif
+}
+
+// The inverse of SpillSRA, for resuming the interrupted JIT code with the guest state in the frame.
+void SignalDelegator::FillSRA(FEXCore::Core::InternalThreadState* Thread, void* ucontext, uint32_t IgnoreMask, uint32_t ChangedEFLAGS) {
+#ifdef ARCHITECTURE_arm64
+  const auto& State = Thread->CurrentFrame->State;
+  // A 32-bit guest frame only has the first eight registers, the frame's copy of the rest predates the spill.
+  const size_t GuestRegs = Is64BitMode ? 16 : 8;
+
+  for (size_t i = 0; i < std::min<size_t>(Config.SRAGPRCount, GuestRegs); i++) {
+    const uint8_t SRAIdxMap = Config.SRAGPRMapping[i];
+    if (IgnoreMask & (1U << SRAIdxMap)) {
+      // Already spilled, the JIT reloads it from the frame
+      continue;
+    }
+    ArchHelpers::Context::SetArmReg(ucontext, SRAIdxMap, State.gregs[i]);
+  }
+
+  // Like SpillSRA, this leaves the upper 128-bits of 256-bit registers alone.
+  auto* FPRs = ArchHelpers::Context::GetArmFPRs(ucontext);
+  for (size_t i = 0; i < std::min<size_t>(Config.SRAFPRCount, GuestRegs); i++) {
+    const void* XMM = SupportsAVX && SupportsSVE256 ? &State.xmm.avx.data[i][0] : &State.xmm.sse.data[i][0];
+    memcpy(&FPRs[Config.SRAFPRMapping[i]], XMM, sizeof(__uint128_t));
+  }
+
+  ArchHelpers::Context::SetArmPState(
+    ucontext, CTX->FlipHostEFLAGS(ChangedEFLAGS, ArchHelpers::Context::GetArmGPRs(ucontext), ArchHelpers::Context::GetArmPState(ucontext)));
 #endif
 }
 
@@ -269,20 +298,31 @@ void SignalDelegator::RestoreThreadState(FEXCore::Core::InternalThreadState* Thr
   if (Context->UContextLocation) {
     auto Frame = Thread->CurrentFrame;
 
-    if (Context->Flags & ArchHelpers::Context::ContextFlags::CONTEXT_FLAG_INJIT) {
-      // XXX: Unsupported since it needs state reconstruction
-      // If we are in the JIT then SRA might need to be restored to values from the context
-      // We can't currently support this since it might result in tearing without real state reconstruction
-    }
-
+    // Like the kernel, take the whole guest state from the signal frame, so changes the handler made to it take effect.
     if (Is64BitMode) {
-      RestoreFrame_x64(Thread, Context, Frame, ucontext);
+      RestoreFrame_x64(Thread, Context, Frame);
     } else {
       if (Type == RestoreType::TYPE_NONREALTIME) {
-        RestoreFrame_ia32(Thread, Context, Frame, ucontext);
+        RestoreFrame_ia32(Thread, Context, Frame);
       } else {
-        RestoreRTFrame_ia32(Thread, Context, Frame, ucontext);
+        RestoreRTFrame_ia32(Thread, Context, Frame);
       }
+    }
+
+    if (Context->OriginalRIP != Frame->State.rip || Context->FaultToTopAndGeneratedException) {
+      // The guest moved RIP, go back to the top of the dispatcher to run from there
+      // The dispatcher will run a different guest instruction, so the interrupted syscall won't clear its spill mask.
+      Frame->InSyscallInfo = 0;
+      ArchHelpers::Context::SetPc(ucontext, Config.AbsoluteLoopTopAddressFillSRA);
+      ArchHelpers::Context::SetFillSRASingleInst(ucontext, false);
+      // Set our state register to point to our guest thread data
+      ArchHelpers::Context::SetState(ucontext, reinterpret_cast<uint64_t>(Frame));
+    } else if (Context->Flags &
+               (ArchHelpers::Context::ContextFlags::CONTEXT_FLAG_INJIT | ArchHelpers::Context::ContextFlags::CONTEXT_FLAG_INDISPATCHER)) {
+      // The interrupted code resumes with the static registers it holds in host registers, put the frame's values there.
+      // Flags only get the handler's changes: the JIT may hold them in a different form at this point.
+      const uint32_t ChangedEFLAGS = Context->OriginalEFLAGS ^ CTX->ReconstructCompactedEFLAGS(Thread, false, nullptr, 0);
+      FillSRA(Thread, ucontext, Context->InSyscallInfo & 0xFFFF, ChangedEFLAGS);
     }
   }
 }
@@ -322,17 +362,9 @@ bool SignalDelegator::HandleDispatcherGuestSignal(FEXCore::Core::InternalThreadS
     SpillSRA(Thread, ucontext, IgnoreMask);
 
     ContextBackup->Flags |= ArchHelpers::Context::ContextFlags::CONTEXT_FLAG_INJIT;
-  } else {
-    if (!IsAddressInDispatcher(OldPC)) {
-      // This is likely to cause issues but in some cases it isn't fatal
-      // This can also happen if we have put a signal on hold, then we just reenabled the signal
-      // So we are in the syscall handler
-      // Only throw a log message in this case
-      if constexpr (false) {
-        // XXX: Messages in the signal handler can cause us to crash
-        LogMan::Msg::EFmt("Signals in dispatcher have unsynchronized context");
-      }
-    }
+  } else if (IsAddressInDispatcher(OldPC)) {
+    // Signals only arrive at points where the dispatcher holds the guest state in both the frame and the static registers.
+    ContextBackup->Flags |= ArchHelpers::Context::ContextFlags::CONTEXT_FLAG_INDISPATCHER;
   }
 
   // The guest handler isn't in a syscall, even when the signal arrived in the syscall handler. StoreThreadState saved the
@@ -363,6 +395,7 @@ bool SignalDelegator::HandleDispatcherGuestSignal(FEXCore::Core::InternalThreadS
 
   ContextBackup->OriginalRIP = Thread->CurrentFrame->State.rip;
   uint32_t eflags = CTX->ReconstructCompactedEFLAGS(Thread, false, nullptr, 0);
+  ContextBackup->OriginalEFLAGS = eflags;
 
   if (Is64BitMode) {
     NewGuestSP = SetupFrame_x64(Thread, ContextBackup, Frame, Signal, HostSigInfo, ucontext, GuestAction, GuestStack, NewGuestSP, eflags);
@@ -620,6 +653,13 @@ void SignalDelegator::HandleGuestSignal(FEX::HLE::ThreadStateObject* ThreadObjec
   auto SigInfo = *static_cast<siginfo_t*>(Info);
 
   auto MustDeferSignal = (Thread->CurrentFrame->State.DeferredSignalRefCount.Load() != 0);
+
+  // JIT and dispatcher code is only at a guest instruction boundary at its pending interrupt checks, and between them it
+  // can hold guest state the frame can't show, like a register mid-update or an address computed from one. Wait for the next
+  // check, so the guest handler sees and changes exact state. Not while the thread is marked as in a syscall: that state is
+  // exact as well, and a blocking syscall must be interrupted.
+  const auto PC = ArchHelpers::Context::GetPc(UContext);
+  const bool BetweenChecks = (CTX->IsAddressInCodeBuffer(Thread, PC) || IsAddressInDispatcher(PC)) && Thread->CurrentFrame->InSyscallInfo == 0;
   if (Signal == SIGSEGV && SigInfo.si_code == SEGV_ACCERR && SigInfo.si_addr == reinterpret_cast<void*>(&Thread->InterruptFaultPage)) {
     if (!MustDeferSignal) {
       // We just reached the end of the outermost signal-deferring section and faulted to check for pending signals.
@@ -661,7 +701,7 @@ void SignalDelegator::HandleGuestSignal(FEX::HLE::ThreadStateObject* ThreadObjec
       ERROR_AND_DIE_FMT("X86 shouldn't hit this InterruptFaultPage");
 #endif
     }
-  } else if (IsAsyncSignal(&SigInfo, Signal) && MustDeferSignal) {
+  } else if (IsAsyncSignal(&SigInfo, Signal) && (MustDeferSignal || BetweenChecks)) {
     // If the signal is asynchronous (as determined by si_code) and FEX is in a state of needing
     // to defer the signal, then add the signal to the thread's signal queue.
     LOGMAN_THROW_A_FMT(ThreadObject->SignalInfo.DeferredSignalFrames.size() != ThreadObject->SignalInfo.DeferredSignalFrames.capacity(),

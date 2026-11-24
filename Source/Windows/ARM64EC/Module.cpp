@@ -1163,6 +1163,7 @@ void NotifyUnmapViewOfSection(void* Address, BOOL After, NTSTATUS Status) {
       HandleImageUnmap(Start, Size);
     }
   } else {
+    InvalidationTracker->EndSectionUnmap();
     ThreadCreationMutex.unlock();
   }
 }

@@ -306,6 +306,14 @@ DEF_OP(Thunk) {
 
   PushDynamicRegs(TMP1);
 
+  if (CTX->Config.NeedsPendingInterruptFaultCheck) {
+    // The host function may block, so take pending signals first, and mark the thread so the ones that arrive from here on
+    // are taken right away.
+    LoadConstant(ARMEmitter::Size::i64Bit, TMP1, FEXCore::Core::CpuStateFrame::IN_THUNK_CALL);
+    str(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, InSyscallInfo));
+    EmitPendingInterruptFaultCheck();
+  }
+
   mov(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r0, GetReg(Op->ArgPtr));
 
   InsertNamedThunkRelocation(ARMEmitter::Reg::r2, Op->ThunkNameHash);
@@ -321,6 +329,10 @@ DEF_OP(Thunk) {
   FillStaticRegs({
     .NZCV = false,
   });
+
+  if (CTX->Config.NeedsPendingInterruptFaultCheck) {
+    str(ARMEmitter::XReg::zr, STATE, offsetof(FEXCore::Core::CpuStateFrame, InSyscallInfo));
+  }
 }
 
 DEF_OP(ValidateCode) {

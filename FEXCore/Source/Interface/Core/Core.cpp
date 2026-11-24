@@ -371,10 +371,36 @@ void ContextImpl::SetFlagsFromCompactedEFLAGS(FEXCore::Core::InternalThreadState
   Frame->State.flags[X86State::RFLAG_IF_LOC] = 1;
 }
 
+uint64_t ContextImpl::FlipHostEFLAGS(uint32_t ChangedEFLAGS, uint64_t* HostGPRs, uint64_t PSTATE) {
+  const auto Changed = [ChangedEFLAGS](unsigned Flag) -> uint64_t {
+    return (ChangedEFLAGS >> Flag) & 1;
+  };
+
+  for (unsigned Flag : {X86State::RFLAG_CF_RAW_LOC, X86State::RFLAG_ZF_RAW_LOC, X86State::RFLAG_SF_RAW_LOC, X86State::RFLAG_OF_RAW_LOC}) {
+    PSTATE ^= Changed(Flag) << IR::OpDispatchBuilder::IndexNZCV(Flag);
+  }
+
+  if (HostFeatures.SupportsAPFLG) {
+    PSTATE ^= Changed(X86State::RFLAG_PF_RAW_LOC) << IR::OpDispatchBuilder::APFLG_PF_BIT;
+    PSTATE ^= Changed(X86State::RFLAG_AF_RAW_LOC) << IR::OpDispatchBuilder::APFLG_AF_BIT;
+  } else {
+    // PF is the inverted parity of the low byte of REG_PF, AF is bit 4 of REG_AF ^ REG_PF.
+    HostGPRs[CPU::REG_PF.Idx()] ^= Changed(X86State::RFLAG_PF_RAW_LOC);
+    HostGPRs[CPU::REG_AF.Idx()] ^= Changed(X86State::RFLAG_AF_RAW_LOC) << 4;
+  }
+
+  return PSTATE;
+}
+
 bool ContextImpl::InitCore() {
   if (CodeCache.IsGeneratingCache || FEXCore::Config::Get_ENABLECODECACHINGWIP()) {
     // Start with a larger code buffer to avoid resizes that would discard code
     StartMaximalCodeBuffer();
+  }
+
+  if (Config.GdbServer || SignalDelegation->NeedsPendingInterruptFaultCheck()) {
+    // gdbserver pauses threads at these checks, and the frontend may take signals there.
+    Config.NeedsPendingInterruptFaultCheck = true;
   }
 
   // Initialize the CPU core signal handlers & DispatcherConfig
@@ -382,11 +408,6 @@ bool ContextImpl::InitCore() {
 
   // Set up the SignalDelegator config since core is initialized.
   SignalDelegation->SetConfig(Dispatcher->MakeSignalDelegatorConfig());
-
-  if (Config.GdbServer) {
-    // If gdbserver is enabled then this needs to be enabled.
-    Config.NeedsPendingInterruptFaultCheck = true;
-  }
 
   if constexpr (BLOCK_DEBUGGING) {
     // If the developer wants to do any single-stepping points or watch points.
@@ -942,7 +963,7 @@ uintptr_t ContextImpl::CompileBlockLocked(FEXCore::Core::CpuStateFrame* Frame, u
     return HostCode;
   }
 
-  Thread->FrontendDecoder->SetupDecodeInstructionsAtEntry(Thread, GuestRIP, MaxInst);
+  Thread->FrontendDecoder->SetupDecodeInstructionsAtEntry(Thread, GuestRIP, MaxInst, true);
 
   std::optional<ExecutableFileSectionInfo> Region = SyscallHandler->LookupExecutableFileSection(Thread, GuestRIP);
   std::optional<DiskCache::CodeHitData> Hit;
@@ -954,9 +975,11 @@ uintptr_t ContextImpl::CompileBlockLocked(FEXCore::Core::CpuStateFrame* Frame, u
       auto LoadedCode = Thread->CPUBackend->LoadCachedCode(Hit->HostCode);
       if (LoadedCode.BlockBegin) {
         for (auto& CodePage : Hit->GuestPages) {
-          if (Thread->LookupCache->AddBlockExecutableRange(Thread, Hit->EntryPointRIPs, CodePage, FEXCore::Utils::FEX_PAGE_SIZE)) {
+          // Protect before the page is recorded: a decoder that finds code on a page takes it as protected
+          if (!Thread->LookupCache->HasCodePage(CodePage)) {
             SyscallHandler->MarkGuestExecutableRange(Thread, CodePage, FEXCore::Utils::FEX_PAGE_SIZE);
           }
+          Thread->LookupCache->AddBlockExecutableRange(Thread, Hit->EntryPointRIPs, CodePage, FEXCore::Utils::FEX_PAGE_SIZE);
         }
 
         LOGMAN_THROW_A_FMT(Hit->EntryPointRIPs.size() == Hit->EntryPointHostOffsets.size(), "Mismatched Disk Cache entrypoint pairs!");
@@ -1044,15 +1067,13 @@ uintptr_t ContextImpl::CompileBlockLocked(FEXCore::Core::CpuStateFrame* Frame, u
   fextl::vector<uint64_t> CodePages;
 
   if (NeedsAddGuestCodeRanges) {
-    // Track in the guest to host map all entrypoints for all pages the compiled block touches, if any page didn't previously
-    // contain code, inform the frontend so it can setup SMC detection.
+    // Track in the guest to host map all entrypoints for all pages the compiled block touches. The decoder already set up SMC
+    // detection for the pages that had no code.
     auto BlockInfo = Thread->FrontendDecoder->GetDecodedBlockInfo();
     CodePages.reserve(BlockInfo->CodePages.size());
     CodePages.insert(CodePages.end(), BlockInfo->CodePages.begin(), BlockInfo->CodePages.end());
     for (auto CodePage : BlockInfo->CodePages) {
-      if (Thread->LookupCache->AddBlockExecutableRange(Thread, BlockInfo->EntryPoints, CodePage, FEXCore::Utils::FEX_PAGE_SIZE)) {
-        SyscallHandler->MarkGuestExecutableRange(Thread, CodePage, FEXCore::Utils::FEX_PAGE_SIZE);
-      }
+      Thread->LookupCache->AddBlockExecutableRange(Thread, BlockInfo->EntryPoints, CodePage, FEXCore::Utils::FEX_PAGE_SIZE);
     }
   }
 

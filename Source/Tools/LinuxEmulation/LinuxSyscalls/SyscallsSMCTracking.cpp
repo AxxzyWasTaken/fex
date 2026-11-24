@@ -95,21 +95,26 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
 
       auto Offset = FaultBase - Entry->first + Entry->second.Offset;
 
-      auto VMA = Entry->second.Resource->FirstVMA;
-      LOGMAN_THROW_A_FMT(VMA, "VMA tracking error");
+      LOGMAN_THROW_A_FMT(Entry->second.Resource->FirstVMA, "VMA tracking error");
 
-      // Flush all mirrors, remap the page writable as needed
-      do {
-        if (VMA->Offset <= Offset && (VMA->Offset + VMA->Length) > Offset) {
-          auto FaultBaseMirrored = Offset - VMA->Offset + VMA->Base;
-
-          if (VMA->Prot.Writable) {
-            _SyscallHandler->TM.InvalidateGuestCodeRange(Thread, FaultBaseMirrored, FEXCore::Utils::FEX_PAGE_SIZE, UnprotectRegionCallback);
-          } else {
-            _SyscallHandler->TM.InvalidateGuestCodeRange(Thread, FaultBaseMirrored, FEXCore::Utils::FEX_PAGE_SIZE);
+      // Flush all mirrors, then remap the page writable in the writable ones, all without code being compiled in between.
+      // Otherwise a thread could translate the page again from a mirror that is already flushed, while the writable mirrors are
+      // still protected, and keep that translation once they are unprotected: the writes that follow wouldn't fault.
+      _SyscallHandler->TM.InvalidateGuestCodeRanges(Thread, [&](auto&& Invalidate) {
+        for (const bool Unprotect : {false, true}) {
+          for (auto VMA = Entry->second.Resource->FirstVMA; VMA; VMA = VMA->ResourceNextVMA) {
+            if (VMA->Offset > Offset || VMA->Offset + VMA->Length <= Offset) {
+              continue;
+            }
+            const auto FaultBaseMirrored = Offset - VMA->Offset + VMA->Base;
+            if (!Unprotect) {
+              Invalidate(FaultBaseMirrored, FEXCore::Utils::FEX_PAGE_SIZE);
+            } else if (VMA->Prot.Writable) {
+              UnprotectRegionCallback(FaultBaseMirrored, FEXCore::Utils::FEX_PAGE_SIZE);
+            }
           }
         }
-      } while ((VMA = VMA->ResourceNextVMA));
+      });
     } else {
       _SyscallHandler->TM.InvalidateGuestCodeRange(Thread, FaultBase, FEXCore::Utils::FEX_PAGE_SIZE, UnprotectRegionCallback);
     }
@@ -192,6 +197,45 @@ void SyscallHandler::MarkGuestExecutableRange(FEXCore::Core::InternalThreadState
           LogMan::Throw::AFmt(rv == 0, "mprotect({}, {}) failed", ProtectBase, ProtectSize);
         }
       }
+    }
+  }
+}
+
+void SyscallHandler::ProtectNewWritableAliases(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) {
+  if (Length == 0 || SMCChecks != FEXCore::Config::CONFIG_SMC_MTRACK) {
+    return;
+  }
+
+  const bool ReadImpliesExec = Thread && (FEX::HLE::ThreadManager::GetStateObjectFromFEXCoreThread(Thread)->persona & READ_IMPLIES_EXEC);
+  const auto Top = FEXCore::AlignUp(Start + Length, FEXCore::Utils::FEX_PAGE_SIZE);
+
+  for (auto Mapping = VMATracking.VMAs.lower_bound(Top); Mapping != VMATracking.VMAs.begin();) {
+    --Mapping;
+    const auto& View = Mapping->second;
+    if (View.Base + View.Length <= Start) {
+      break;
+    }
+    if (!View.Flags.Shared || !View.Prot.Writable) {
+      continue;
+    }
+    LOGMAN_THROW_A_FMT(View.Resource, "VMA tracking error");
+
+    const auto ViewBase = std::max(View.Base, Start);
+    const auto OffsetBase = ViewBase - View.Base + View.Offset;
+    const auto OffsetTop = OffsetBase + (std::min(View.Base + View.Length, Top) - ViewBase);
+
+    // The view's own code (if it is also executable) was invalidated by the mmap or mprotect that made it writable
+    for (auto VMA = View.Resource->FirstVMA; VMA; VMA = VMA->ResourceNextVMA) {
+      const bool Decodable = VMA->Prot.Executable || (ReadImpliesExec && VMA->Prot.Readable);
+      if (VMA == &View || !Decodable || VMA->Offset >= OffsetTop || VMA->Offset + VMA->Length <= OffsetBase) {
+        continue;
+      }
+
+      const auto ProtectOffset = std::max(VMA->Offset, OffsetBase);
+      const auto ProtectSize = std::min(VMA->Offset + VMA->Length, OffsetTop) - ProtectOffset;
+      const auto ProtectBase = ProtectOffset - View.Offset + View.Base;
+      auto rv = mprotect(reinterpret_cast<void*>(ProtectBase), ProtectSize, PROT_READ);
+      LogMan::Throw::AFmt(rv == 0, "mprotect({}, {}) failed", ProtectBase, ProtectSize);
     }
   }
 }
@@ -341,6 +385,7 @@ void* SyscallHandler::GuestMmap(bool Is64Bit, FEXCore::Core::InternalThreadState
     }
 
     LateMetadata = TrackMmap(Thread, Result, length, prot, flags, fd, offset, CachedSection);
+    ProtectNewWritableAliases(Thread, Result, Size);
     PendingResourceDeletion = VMATracking.HasPendingResourceDeletions();
   }
 
@@ -415,6 +460,7 @@ uint64_t SyscallHandler::GuestMremap(bool Is64Bit, FEXCore::Core::InternalThread
       }
     }
     TrackMremap(Thread, reinterpret_cast<uint64_t>(old_address), old_size, new_size, flags, Result);
+    ProtectNewWritableAliases(Thread, Result, new_size);
   }
 
   InvalidateCodeRangeIfNecessaryOnRemap(Thread, reinterpret_cast<uint64_t>(old_address), Result, old_size, new_size);
@@ -486,6 +532,9 @@ uint64_t SyscallHandler::GuestMprotect(FEXCore::Core::InternalThreadState* Threa
     }
 
     TrackMprotect(Thread, addr, len, prot);
+    if (prot & PROT_WRITE) {
+      ProtectNewWritableAliases(Thread, reinterpret_cast<uint64_t>(addr), len);
+    }
   }
 
   InvalidateCodeRangeIfNecessary(Thread, reinterpret_cast<uint64_t>(addr), len, false);
@@ -551,6 +600,7 @@ uint64_t SyscallHandler::GuestShmat(bool Is64Bit, FEXCore::Core::InternalThreadS
 
     Length = stat.shm_segsz;
     TrackShmat(Thread, shmid, Result, shmflg, Length);
+    ProtectNewWritableAliases(Thread, Result, Length);
     PendingResourceDeletion = VMATracking.HasPendingResourceDeletions();
   }
 

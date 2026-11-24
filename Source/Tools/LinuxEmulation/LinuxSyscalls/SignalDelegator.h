@@ -115,6 +115,11 @@ public:
     return reinterpret_cast<uintptr_t>(VDSOPointers.VDSO_FEX_CallbackRET);
   }
 
+  // Asynchronous signals that arrive in JIT or dispatcher code wait for the next check, see HandleGuestSignal.
+  bool NeedsPendingInterruptFaultCheck() const override {
+    return true;
+  }
+
   [[noreturn]]
   void HandleSignalHandlerReturn(bool RT) {
     using SignalHandlerReturnFunc = void (*)();
@@ -145,6 +150,7 @@ public:
   void SaveTelemetry();
 
   void SpillSRA(FEXCore::Core::InternalThreadState* Thread, void* ucontext, uint32_t IgnoreMask);
+  void FillSRA(FEXCore::Core::InternalThreadState* Thread, void* ucontext, uint32_t IgnoreMask, uint32_t ChangedEFLAGS);
 
 private:
   enum DefaultBehaviourType {
@@ -258,11 +264,11 @@ private:
   };
 
   void RestoreFrame_x64(FEXCore::Core::InternalThreadState* Thread, ArchHelpers::Context::ContextBackup* Context,
-                        FEXCore::Core::CpuStateFrame* Frame, void* ucontext);
+                        FEXCore::Core::CpuStateFrame* Frame);
   void RestoreFrame_ia32(FEXCore::Core::InternalThreadState* Thread, ArchHelpers::Context::ContextBackup* Context,
-                         FEXCore::Core::CpuStateFrame* Frame, void* ucontext);
+                         FEXCore::Core::CpuStateFrame* Frame);
   void RestoreRTFrame_ia32(FEXCore::Core::InternalThreadState* Thread, ArchHelpers::Context::ContextBackup* Context,
-                           FEXCore::Core::CpuStateFrame* Frame, void* ucontext);
+                           FEXCore::Core::CpuStateFrame* Frame);
 
   ///< Setup the signal frame for x64.
   uint64_t SetupFrame_x64(FEXCore::Core::InternalThreadState* Thread, ArchHelpers::Context::ContextBackup* ContextBackup,

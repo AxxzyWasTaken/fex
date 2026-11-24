@@ -123,237 +123,201 @@ static void SetXStateInfo(T* xstate, bool is_avx_enabled) {
 }
 
 void SignalDelegator::RestoreFrame_x64(FEXCore::Core::InternalThreadState* Thread, ArchHelpers::Context::ContextBackup* Context,
-                                       FEXCore::Core::CpuStateFrame* Frame, void* ucontext) {
+                                       FEXCore::Core::CpuStateFrame* Frame) {
   auto* guest_uctx = reinterpret_cast<FEXCore::x86_64::ucontext_t*>(Context->UContextLocation);
   [[maybe_unused]] auto* guest_siginfo = reinterpret_cast<siginfo_t*>(Context->SigInfoLocation);
 
-  // If the guest modified the RIP then we need to take special precautions here
-  if (Context->OriginalRIP != guest_uctx->uc_mcontext.gregs[FEXCore::x86_64::FEX_REG_RIP] || Context->FaultToTopAndGeneratedException) {
-    // Hack! Go back to the top of the dispatcher top
-    // This is only safe inside the JIT rather than anything outside of it
-    // The dispatcher will run a different guest instruction, so the interrupted syscall won't clear its spill mask.
-    Frame->InSyscallInfo = 0;
-    ArchHelpers::Context::SetPc(ucontext, Config.AbsoluteLoopTopAddressFillSRA);
-    ArchHelpers::Context::SetFillSRASingleInst(ucontext, false);
-    // Set our state register to point to our guest thread data
-    ArchHelpers::Context::SetState(ucontext, reinterpret_cast<uint64_t>(Frame));
+  Frame->State.rip = guest_uctx->uc_mcontext.gregs[FEXCore::x86_64::FEX_REG_RIP];
 
-    Frame->State.rip = guest_uctx->uc_mcontext.gregs[FEXCore::x86_64::FEX_REG_RIP];
+  // Restore segments.
+  // FS and GS are explicitly ignored here, as WRFSGSbase is used instead.
+  Frame->State.cs_idx = (guest_uctx->uc_mcontext.gregs[FEXCore::x86_64::FEX_REG_CSGSFS] >> 0) & 0xffff;
+  Frame->State.ss_idx = (guest_uctx->uc_mcontext.gregs[FEXCore::x86_64::FEX_REG_CSGSFS] >> 48) & 0xffff;
 
-    // Restore segments.
-    // FS and GS are explicitly ignored here, as WRFSGSbase is used instead.
-    Frame->State.cs_idx = (guest_uctx->uc_mcontext.gregs[FEXCore::x86_64::FEX_REG_CSGSFS] >> 0) & 0xffff;
-    Frame->State.ss_idx = (guest_uctx->uc_mcontext.gregs[FEXCore::x86_64::FEX_REG_CSGSFS] >> 48) & 0xffff;
+  Frame->State.cs_cached = Frame->State.CalculateGDTBase(*Frame->State.GetSegmentFromIndex(Frame->State, Frame->State.cs_idx));
+  Frame->State.ss_cached = Frame->State.CalculateGDTBase(*Frame->State.GetSegmentFromIndex(Frame->State, Frame->State.ss_idx));
 
-    Frame->State.cs_cached = Frame->State.CalculateGDTBase(*Frame->State.GetSegmentFromIndex(Frame->State, Frame->State.cs_idx));
-    Frame->State.ss_cached = Frame->State.CalculateGDTBase(*Frame->State.GetSegmentFromIndex(Frame->State, Frame->State.ss_idx));
-
-    // XXX: Full context setting
-    CTX->SetFlagsFromCompactedEFLAGS(Thread, guest_uctx->uc_mcontext.gregs[FEXCore::x86_64::FEX_REG_EFL]);
+  // XXX: Full context setting
+  CTX->SetFlagsFromCompactedEFLAGS(Thread, guest_uctx->uc_mcontext.gregs[FEXCore::x86_64::FEX_REG_EFL]);
 
 #define COPY_REG(x) Frame->State.gregs[FEXCore::X86State::REG_##x] = guest_uctx->uc_mcontext.gregs[FEXCore::x86_64::FEX_REG_##x];
-    COPY_REG(R8);
-    COPY_REG(R9);
-    COPY_REG(R10);
-    COPY_REG(R11);
-    COPY_REG(R12);
-    COPY_REG(R13);
-    COPY_REG(R14);
-    COPY_REG(R15);
-    COPY_REG(RDI);
-    COPY_REG(RSI);
-    COPY_REG(RBP);
-    COPY_REG(RBX);
-    COPY_REG(RDX);
-    COPY_REG(RAX);
-    COPY_REG(RCX);
-    COPY_REG(RSP);
+  COPY_REG(R8);
+  COPY_REG(R9);
+  COPY_REG(R10);
+  COPY_REG(R11);
+  COPY_REG(R12);
+  COPY_REG(R13);
+  COPY_REG(R14);
+  COPY_REG(R15);
+  COPY_REG(RDI);
+  COPY_REG(RSI);
+  COPY_REG(RBP);
+  COPY_REG(RBX);
+  COPY_REG(RDX);
+  COPY_REG(RAX);
+  COPY_REG(RCX);
+  COPY_REG(RSP);
 #undef COPY_REG
-    auto* xstate = reinterpret_cast<FEXCore::x86_64::xstate*>(guest_uctx->uc_mcontext.fpregs);
-    auto* fpstate = &xstate->fpstate;
+  auto* xstate = reinterpret_cast<FEXCore::x86_64::xstate*>(guest_uctx->uc_mcontext.fpregs);
+  auto* fpstate = &xstate->fpstate;
 
-    if (SupportsAVX) {
-      CTX->SetXMMRegistersFromState(Thread, fpstate->_xmm, xstate->ymmh.ymmh_space);
-    } else {
-      CTX->SetXMMRegistersFromState(Thread, fpstate->_xmm, nullptr);
-    }
+  if (SupportsAVX) {
+    CTX->SetXMMRegistersFromState(Thread, fpstate->_xmm, xstate->ymmh.ymmh_space);
+  } else {
+    CTX->SetXMMRegistersFromState(Thread, fpstate->_xmm, nullptr);
+  }
 
-    // Technically if mxcsr contains invalid bits then rt_sigreturn should return -EINVAL.
-    // TODO: FEX doesn't support this today.
-    Frame->State.mxcsr = fpstate->mxcsr & 0xFFC0;
+  // Technically if mxcsr contains invalid bits then rt_sigreturn should return -EINVAL.
+  // TODO: FEX doesn't support this today.
+  Frame->State.mxcsr = fpstate->mxcsr & 0xFFC0;
 
-    // FCW store default
-    Frame->State.FCW = fpstate->fcw;
-    Frame->State.AbridgedFTW = fpstate->ftw;
+  // FCW store default
+  Frame->State.FCW = fpstate->fcw;
+  Frame->State.AbridgedFTW = fpstate->ftw;
 
-    // Deconstruct FSW
-    Frame->State.flags[FEXCore::X86State::X87FLAG_IE_LOC] = fpstate->fsw & 1;
-    Frame->State.flags[FEXCore::X86State::X87FLAG_C0_LOC] = (fpstate->fsw >> 8) & 1;
-    Frame->State.flags[FEXCore::X86State::X87FLAG_C1_LOC] = (fpstate->fsw >> 9) & 1;
-    Frame->State.flags[FEXCore::X86State::X87FLAG_C2_LOC] = (fpstate->fsw >> 10) & 1;
-    Frame->State.flags[FEXCore::X86State::X87FLAG_C3_LOC] = (fpstate->fsw >> 14) & 1;
-    Frame->State.flags[FEXCore::X86State::X87FLAG_TOP_LOC] = (fpstate->fsw >> 11) & 0b111;
+  // Deconstruct FSW
+  Frame->State.flags[FEXCore::X86State::X87FLAG_IE_LOC] = fpstate->fsw & 1;
+  Frame->State.flags[FEXCore::X86State::X87FLAG_C0_LOC] = (fpstate->fsw >> 8) & 1;
+  Frame->State.flags[FEXCore::X86State::X87FLAG_C1_LOC] = (fpstate->fsw >> 9) & 1;
+  Frame->State.flags[FEXCore::X86State::X87FLAG_C2_LOC] = (fpstate->fsw >> 10) & 1;
+  Frame->State.flags[FEXCore::X86State::X87FLAG_C3_LOC] = (fpstate->fsw >> 14) & 1;
+  Frame->State.flags[FEXCore::X86State::X87FLAG_TOP_LOC] = (fpstate->fsw >> 11) & 0b111;
 
-    // Copy float registers
-    const uint16_t CurrentOffset = Frame->State.flags[FEXCore::X86State::X87FLAG_TOP_LOC];
-    for (size_t i = 0; i < FEXCore::Core::CPUState::NUM_MMS; ++i) {
-      const auto modulo_i = (i + CurrentOffset) % 8;
-      memcpy(&Frame->State.mm[modulo_i], &fpstate->_st[i], sizeof(Frame->State.mm[0]));
-    }
+  // Copy float registers
+  const uint16_t CurrentOffset = Frame->State.flags[FEXCore::X86State::X87FLAG_TOP_LOC];
+  for (size_t i = 0; i < FEXCore::Core::CPUState::NUM_MMS; ++i) {
+    const auto modulo_i = (i + CurrentOffset) % 8;
+    memcpy(&Frame->State.mm[modulo_i], &fpstate->_st[i], sizeof(Frame->State.mm[0]));
   }
 }
 
 void SignalDelegator::RestoreFrame_ia32(FEXCore::Core::InternalThreadState* Thread, ArchHelpers::Context::ContextBackup* Context,
-                                        FEXCore::Core::CpuStateFrame* Frame, void* ucontext) {
+                                        FEXCore::Core::CpuStateFrame* Frame) {
   SigFrame_i32* guest_uctx = reinterpret_cast<SigFrame_i32*>(Context->UContextLocation);
-  // If the guest modified the RIP then we need to take special precautions here
-  if (Context->OriginalRIP != guest_uctx->sc.ip || Context->FaultToTopAndGeneratedException) {
-    // Hack! Go back to the top of the dispatcher top
-    // This is only safe inside the JIT rather than anything outside of it
-    // The dispatcher will run a different guest instruction, so the interrupted syscall won't clear its spill mask.
-    Frame->InSyscallInfo = 0;
-    ArchHelpers::Context::SetPc(ucontext, Config.AbsoluteLoopTopAddressFillSRA);
-    ArchHelpers::Context::SetFillSRASingleInst(ucontext, false);
-    // Set our state register to point to our guest thread data
-    ArchHelpers::Context::SetState(ucontext, reinterpret_cast<uint64_t>(Frame));
+  // XXX: Full context setting
+  CTX->SetFlagsFromCompactedEFLAGS(Thread, guest_uctx->sc.flags);
 
-    // XXX: Full context setting
-    CTX->SetFlagsFromCompactedEFLAGS(Thread, guest_uctx->sc.flags);
+  Frame->State.rip = guest_uctx->sc.ip;
+  Frame->State.cs_idx = guest_uctx->sc.cs;
+  Frame->State.ds_idx = guest_uctx->sc.ds;
+  Frame->State.es_idx = guest_uctx->sc.es;
+  Frame->State.fs_idx = guest_uctx->sc.fs;
+  Frame->State.gs_idx = guest_uctx->sc.gs;
+  Frame->State.ss_idx = guest_uctx->sc.ss;
 
-    Frame->State.rip = guest_uctx->sc.ip;
-    Frame->State.cs_idx = guest_uctx->sc.cs;
-    Frame->State.ds_idx = guest_uctx->sc.ds;
-    Frame->State.es_idx = guest_uctx->sc.es;
-    Frame->State.fs_idx = guest_uctx->sc.fs;
-    Frame->State.gs_idx = guest_uctx->sc.gs;
-    Frame->State.ss_idx = guest_uctx->sc.ss;
-
-    Frame->State.cs_cached = Frame->State.CalculateGDTBase(*Frame->State.GetSegmentFromIndex(Frame->State, Frame->State.cs_idx));
-    Frame->State.ds_cached = Frame->State.CalculateGDTBase(*Frame->State.GetSegmentFromIndex(Frame->State, Frame->State.ds_idx));
-    Frame->State.es_cached = Frame->State.CalculateGDTBase(*Frame->State.GetSegmentFromIndex(Frame->State, Frame->State.es_idx));
-    Frame->State.fs_cached = Frame->State.CalculateGDTBase(*Frame->State.GetSegmentFromIndex(Frame->State, Frame->State.fs_idx));
-    Frame->State.gs_cached = Frame->State.CalculateGDTBase(*Frame->State.GetSegmentFromIndex(Frame->State, Frame->State.gs_idx));
-    Frame->State.ss_cached = Frame->State.CalculateGDTBase(*Frame->State.GetSegmentFromIndex(Frame->State, Frame->State.ss_idx));
+  Frame->State.cs_cached = Frame->State.CalculateGDTBase(*Frame->State.GetSegmentFromIndex(Frame->State, Frame->State.cs_idx));
+  Frame->State.ds_cached = Frame->State.CalculateGDTBase(*Frame->State.GetSegmentFromIndex(Frame->State, Frame->State.ds_idx));
+  Frame->State.es_cached = Frame->State.CalculateGDTBase(*Frame->State.GetSegmentFromIndex(Frame->State, Frame->State.es_idx));
+  Frame->State.fs_cached = Frame->State.CalculateGDTBase(*Frame->State.GetSegmentFromIndex(Frame->State, Frame->State.fs_idx));
+  Frame->State.gs_cached = Frame->State.CalculateGDTBase(*Frame->State.GetSegmentFromIndex(Frame->State, Frame->State.gs_idx));
+  Frame->State.ss_cached = Frame->State.CalculateGDTBase(*Frame->State.GetSegmentFromIndex(Frame->State, Frame->State.ss_idx));
 
 #define COPY_REG(x, y) Frame->State.gregs[FEXCore::X86State::REG_##x] = guest_uctx->sc.y;
-    COPY_REG(RDI, di);
-    COPY_REG(RSI, si);
-    COPY_REG(RBP, bp);
-    COPY_REG(RBX, bx);
-    COPY_REG(RDX, dx);
-    COPY_REG(RAX, ax);
-    COPY_REG(RCX, cx);
-    COPY_REG(RSP, sp);
+  COPY_REG(RDI, di);
+  COPY_REG(RSI, si);
+  COPY_REG(RBP, bp);
+  COPY_REG(RBX, bx);
+  COPY_REG(RDX, dx);
+  COPY_REG(RAX, ax);
+  COPY_REG(RCX, cx);
+  COPY_REG(RSP, sp);
 #undef COPY_REG
-    auto* xstate = reinterpret_cast<FEXCore::x86::xstate*>(guest_uctx->sc.fpstate);
-    auto* fpstate = &xstate->fpstate;
+  auto* xstate = reinterpret_cast<FEXCore::x86::xstate*>(guest_uctx->sc.fpstate);
+  auto* fpstate = &xstate->fpstate;
 
-    // Extended XMM state
-    if (SupportsAVX) {
-      CTX->SetXMMRegistersFromState(Thread, fpstate->_xmm, xstate->ymmh.ymmh_space);
-    } else {
-      CTX->SetXMMRegistersFromState(Thread, fpstate->_xmm, nullptr);
-    }
+  // Extended XMM state
+  if (SupportsAVX) {
+    CTX->SetXMMRegistersFromState(Thread, fpstate->_xmm, xstate->ymmh.ymmh_space);
+  } else {
+    CTX->SetXMMRegistersFromState(Thread, fpstate->_xmm, nullptr);
+  }
 
-    // Invalid bits are silently masked off in 32-bit.
-    Frame->State.mxcsr = fpstate->mxcsr & 0xFFC0;
+  // Invalid bits are silently masked off in 32-bit.
+  Frame->State.mxcsr = fpstate->mxcsr & 0xFFC0;
 
-    // FCW store default
-    Frame->State.FCW = fpstate->fcw;
-    Frame->State.AbridgedFTW = FEXCore::FPState::ConvertToAbridgedFTW(fpstate->ftw);
+  // FCW store default
+  Frame->State.FCW = fpstate->fcw;
+  Frame->State.AbridgedFTW = FEXCore::FPState::ConvertToAbridgedFTW(fpstate->ftw);
 
-    // Deconstruct FSW
-    Frame->State.flags[FEXCore::X86State::X87FLAG_IE_LOC] = fpstate->fsw & 1;
-    Frame->State.flags[FEXCore::X86State::X87FLAG_C0_LOC] = (fpstate->fsw >> 8) & 1;
-    Frame->State.flags[FEXCore::X86State::X87FLAG_C1_LOC] = (fpstate->fsw >> 9) & 1;
-    Frame->State.flags[FEXCore::X86State::X87FLAG_C2_LOC] = (fpstate->fsw >> 10) & 1;
-    Frame->State.flags[FEXCore::X86State::X87FLAG_C3_LOC] = (fpstate->fsw >> 14) & 1;
-    Frame->State.flags[FEXCore::X86State::X87FLAG_TOP_LOC] = (fpstate->fsw >> 11) & 0b111;
+  // Deconstruct FSW
+  Frame->State.flags[FEXCore::X86State::X87FLAG_IE_LOC] = fpstate->fsw & 1;
+  Frame->State.flags[FEXCore::X86State::X87FLAG_C0_LOC] = (fpstate->fsw >> 8) & 1;
+  Frame->State.flags[FEXCore::X86State::X87FLAG_C1_LOC] = (fpstate->fsw >> 9) & 1;
+  Frame->State.flags[FEXCore::X86State::X87FLAG_C2_LOC] = (fpstate->fsw >> 10) & 1;
+  Frame->State.flags[FEXCore::X86State::X87FLAG_C3_LOC] = (fpstate->fsw >> 14) & 1;
+  Frame->State.flags[FEXCore::X86State::X87FLAG_TOP_LOC] = (fpstate->fsw >> 11) & 0b111;
 
-    // Copy float registers
-    const uint16_t CurrentOffset = Frame->State.flags[FEXCore::X86State::X87FLAG_TOP_LOC];
-    for (size_t i = 0; i < FEXCore::Core::CPUState::NUM_MMS; ++i) {
-      // 32-bit st register size is only 10 bytes. Not padded to 16byte like x86-64
-      const auto modulo_i = (i + CurrentOffset) % 8;
-      memcpy(&Frame->State.mm[modulo_i], &fpstate->_st[i], 10);
-    }
+  // Copy float registers
+  const uint16_t CurrentOffset = Frame->State.flags[FEXCore::X86State::X87FLAG_TOP_LOC];
+  for (size_t i = 0; i < FEXCore::Core::CPUState::NUM_MMS; ++i) {
+    // 32-bit st register size is only 10 bytes. Not padded to 16byte like x86-64
+    const auto modulo_i = (i + CurrentOffset) % 8;
+    memcpy(&Frame->State.mm[modulo_i], &fpstate->_st[i], 10);
   }
 }
 
 void SignalDelegator::RestoreRTFrame_ia32(FEXCore::Core::InternalThreadState* Thread, ArchHelpers::Context::ContextBackup* Context,
-                                          FEXCore::Core::CpuStateFrame* Frame, void* ucontext) {
+                                          FEXCore::Core::CpuStateFrame* Frame) {
   RTSigFrame_i32* guest_uctx = reinterpret_cast<RTSigFrame_i32*>(Context->UContextLocation);
-  // If the guest modified the RIP then we need to take special precautions here
-  if (Context->OriginalRIP != guest_uctx->uc.uc_mcontext.gregs[FEXCore::x86::FEX_REG_EIP] || Context->FaultToTopAndGeneratedException) {
-    // Hack! Go back to the top of the dispatcher top
-    // This is only safe inside the JIT rather than anything outside of it
-    // The dispatcher will run a different guest instruction, so the interrupted syscall won't clear its spill mask.
-    Frame->InSyscallInfo = 0;
-    ArchHelpers::Context::SetPc(ucontext, Config.AbsoluteLoopTopAddressFillSRA);
-    ArchHelpers::Context::SetFillSRASingleInst(ucontext, false);
-    // Set our state register to point to our guest thread data
-    ArchHelpers::Context::SetState(ucontext, reinterpret_cast<uint64_t>(Frame));
+  // XXX: Full context setting
+  CTX->SetFlagsFromCompactedEFLAGS(Thread, guest_uctx->uc.uc_mcontext.gregs[FEXCore::x86::FEX_REG_EFL]);
 
-    // XXX: Full context setting
-    CTX->SetFlagsFromCompactedEFLAGS(Thread, guest_uctx->uc.uc_mcontext.gregs[FEXCore::x86::FEX_REG_EFL]);
+  Frame->State.rip = guest_uctx->uc.uc_mcontext.gregs[FEXCore::x86::FEX_REG_EIP];
+  Frame->State.cs_idx = guest_uctx->uc.uc_mcontext.gregs[FEXCore::x86::FEX_REG_CS];
+  Frame->State.ds_idx = guest_uctx->uc.uc_mcontext.gregs[FEXCore::x86::FEX_REG_DS];
+  Frame->State.es_idx = guest_uctx->uc.uc_mcontext.gregs[FEXCore::x86::FEX_REG_ES];
+  Frame->State.fs_idx = guest_uctx->uc.uc_mcontext.gregs[FEXCore::x86::FEX_REG_FS];
+  Frame->State.gs_idx = guest_uctx->uc.uc_mcontext.gregs[FEXCore::x86::FEX_REG_GS];
+  Frame->State.ss_idx = guest_uctx->uc.uc_mcontext.gregs[FEXCore::x86::FEX_REG_SS];
 
-    Frame->State.rip = guest_uctx->uc.uc_mcontext.gregs[FEXCore::x86::FEX_REG_EIP];
-    Frame->State.cs_idx = guest_uctx->uc.uc_mcontext.gregs[FEXCore::x86::FEX_REG_CS];
-    Frame->State.ds_idx = guest_uctx->uc.uc_mcontext.gregs[FEXCore::x86::FEX_REG_DS];
-    Frame->State.es_idx = guest_uctx->uc.uc_mcontext.gregs[FEXCore::x86::FEX_REG_ES];
-    Frame->State.fs_idx = guest_uctx->uc.uc_mcontext.gregs[FEXCore::x86::FEX_REG_FS];
-    Frame->State.gs_idx = guest_uctx->uc.uc_mcontext.gregs[FEXCore::x86::FEX_REG_GS];
-    Frame->State.ss_idx = guest_uctx->uc.uc_mcontext.gregs[FEXCore::x86::FEX_REG_SS];
-
-    Frame->State.cs_cached = Frame->State.CalculateGDTBase(*Frame->State.GetSegmentFromIndex(Frame->State, Frame->State.cs_idx));
-    Frame->State.ds_cached = Frame->State.CalculateGDTBase(*Frame->State.GetSegmentFromIndex(Frame->State, Frame->State.ds_idx));
-    Frame->State.es_cached = Frame->State.CalculateGDTBase(*Frame->State.GetSegmentFromIndex(Frame->State, Frame->State.es_idx));
-    Frame->State.fs_cached = Frame->State.CalculateGDTBase(*Frame->State.GetSegmentFromIndex(Frame->State, Frame->State.fs_idx));
-    Frame->State.gs_cached = Frame->State.CalculateGDTBase(*Frame->State.GetSegmentFromIndex(Frame->State, Frame->State.gs_idx));
-    Frame->State.ss_cached = Frame->State.CalculateGDTBase(*Frame->State.GetSegmentFromIndex(Frame->State, Frame->State.ss_idx));
+  Frame->State.cs_cached = Frame->State.CalculateGDTBase(*Frame->State.GetSegmentFromIndex(Frame->State, Frame->State.cs_idx));
+  Frame->State.ds_cached = Frame->State.CalculateGDTBase(*Frame->State.GetSegmentFromIndex(Frame->State, Frame->State.ds_idx));
+  Frame->State.es_cached = Frame->State.CalculateGDTBase(*Frame->State.GetSegmentFromIndex(Frame->State, Frame->State.es_idx));
+  Frame->State.fs_cached = Frame->State.CalculateGDTBase(*Frame->State.GetSegmentFromIndex(Frame->State, Frame->State.fs_idx));
+  Frame->State.gs_cached = Frame->State.CalculateGDTBase(*Frame->State.GetSegmentFromIndex(Frame->State, Frame->State.gs_idx));
+  Frame->State.ss_cached = Frame->State.CalculateGDTBase(*Frame->State.GetSegmentFromIndex(Frame->State, Frame->State.ss_idx));
 
 #define COPY_REG(x) Frame->State.gregs[FEXCore::X86State::REG_##x] = guest_uctx->uc.uc_mcontext.gregs[FEXCore::x86::FEX_REG_##x];
-    COPY_REG(RDI);
-    COPY_REG(RSI);
-    COPY_REG(RBP);
-    COPY_REG(RBX);
-    COPY_REG(RDX);
-    COPY_REG(RAX);
-    COPY_REG(RCX);
-    COPY_REG(RSP);
+  COPY_REG(RDI);
+  COPY_REG(RSI);
+  COPY_REG(RBP);
+  COPY_REG(RBX);
+  COPY_REG(RDX);
+  COPY_REG(RAX);
+  COPY_REG(RCX);
+  COPY_REG(RSP);
 #undef COPY_REG
-    auto* xstate = reinterpret_cast<FEXCore::x86::xstate*>(guest_uctx->uc.uc_mcontext.fpregs);
-    auto* fpstate = &xstate->fpstate;
+  auto* xstate = reinterpret_cast<FEXCore::x86::xstate*>(guest_uctx->uc.uc_mcontext.fpregs);
+  auto* fpstate = &xstate->fpstate;
 
-    // Extended XMM state
-    if (SupportsAVX) {
-      CTX->SetXMMRegistersFromState(Thread, fpstate->_xmm, xstate->ymmh.ymmh_space);
-    } else {
-      CTX->SetXMMRegistersFromState(Thread, fpstate->_xmm, nullptr);
-    }
+  // Extended XMM state
+  if (SupportsAVX) {
+    CTX->SetXMMRegistersFromState(Thread, fpstate->_xmm, xstate->ymmh.ymmh_space);
+  } else {
+    CTX->SetXMMRegistersFromState(Thread, fpstate->_xmm, nullptr);
+  }
 
-    // Invalid bits are silently masked off in 32-bit.
-    Frame->State.mxcsr = fpstate->mxcsr & 0xFFC0;
+  // Invalid bits are silently masked off in 32-bit.
+  Frame->State.mxcsr = fpstate->mxcsr & 0xFFC0;
 
-    // FCW store default
-    Frame->State.FCW = fpstate->fcw;
-    Frame->State.AbridgedFTW = FEXCore::FPState::ConvertToAbridgedFTW(fpstate->ftw);
+  // FCW store default
+  Frame->State.FCW = fpstate->fcw;
+  Frame->State.AbridgedFTW = FEXCore::FPState::ConvertToAbridgedFTW(fpstate->ftw);
 
-    // Deconstruct FSW
-    Frame->State.flags[FEXCore::X86State::X87FLAG_IE_LOC] = fpstate->fsw & 1;
-    Frame->State.flags[FEXCore::X86State::X87FLAG_C0_LOC] = (fpstate->fsw >> 8) & 1;
-    Frame->State.flags[FEXCore::X86State::X87FLAG_C1_LOC] = (fpstate->fsw >> 9) & 1;
-    Frame->State.flags[FEXCore::X86State::X87FLAG_C2_LOC] = (fpstate->fsw >> 10) & 1;
-    Frame->State.flags[FEXCore::X86State::X87FLAG_C3_LOC] = (fpstate->fsw >> 14) & 1;
-    Frame->State.flags[FEXCore::X86State::X87FLAG_TOP_LOC] = (fpstate->fsw >> 11) & 0b111;
+  // Deconstruct FSW
+  Frame->State.flags[FEXCore::X86State::X87FLAG_IE_LOC] = fpstate->fsw & 1;
+  Frame->State.flags[FEXCore::X86State::X87FLAG_C0_LOC] = (fpstate->fsw >> 8) & 1;
+  Frame->State.flags[FEXCore::X86State::X87FLAG_C1_LOC] = (fpstate->fsw >> 9) & 1;
+  Frame->State.flags[FEXCore::X86State::X87FLAG_C2_LOC] = (fpstate->fsw >> 10) & 1;
+  Frame->State.flags[FEXCore::X86State::X87FLAG_C3_LOC] = (fpstate->fsw >> 14) & 1;
+  Frame->State.flags[FEXCore::X86State::X87FLAG_TOP_LOC] = (fpstate->fsw >> 11) & 0b111;
 
-    // Copy float registers
-    const uint16_t CurrentOffset = Frame->State.flags[FEXCore::X86State::X87FLAG_TOP_LOC];
-    for (size_t i = 0; i < FEXCore::Core::CPUState::NUM_MMS; ++i) {
-      // 32-bit st register size is only 10 bytes. Not padded to 16byte like x86-64
-      const auto modulo_i = (i + CurrentOffset) % 8;
-      memcpy(&Frame->State.mm[modulo_i], &fpstate->_st[i], 10);
-    }
+  // Copy float registers
+  const uint16_t CurrentOffset = Frame->State.flags[FEXCore::X86State::X87FLAG_TOP_LOC];
+  for (size_t i = 0; i < FEXCore::Core::CPUState::NUM_MMS; ++i) {
+    // 32-bit st register size is only 10 bytes. Not padded to 16byte like x86-64
+    const auto modulo_i = (i + CurrentOffset) % 8;
+    memcpy(&Frame->State.mm[modulo_i], &fpstate->_st[i], 10);
   }
 }
 

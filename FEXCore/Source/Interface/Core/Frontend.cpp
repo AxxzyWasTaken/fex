@@ -89,6 +89,12 @@ Decoder::Decoder(FEXCore::Core::InternalThreadState* Thread)
 }
 
 int32_t Decoder::CheckRangeExecutable(uint64_t Address, uint64_t Size) {
+  // The instruction already hit a non-executable byte and is rolled back. Its later bytes stay non-executable even if
+  // the frontend has learnt their range since, or the instruction would partially decode past a byte that faulted.
+  if (HitNonExecutableRange) {
+    return 0;
+  }
+
   // Check for wraparound
   if (Address + Size < Address) {
     // Say that any bytes that wrapped around are unreadable
@@ -166,10 +172,6 @@ std::pair<uint64_t, bool> Decoder::ReadData(uint8_t Size) {
   auto ReadableSize = CheckRangeExecutable(Address, Size);
   if (ReadableSize == Size) {
     std::memcpy(&Res, &InstStream.AdjustedInstStream[InstructionSize], Size);
-  } else {
-    HitNonExecutableRange = true;
-    // See PeekByte, this specific case may cause some executable memory to read as 0 but it doesn't matter as the entire instruction will be rolled back anyway.
-    Res = 0;
   }
 
   // Skip the number of decoded bytes regardless to get instruction size.
@@ -181,6 +183,12 @@ std::pair<uint64_t, bool> Decoder::ReadData(uint8_t Size) {
 #else
   SkipBytes(std::abs(ReadableSize));
 #endif
+
+  if (ReadableSize != Size) {
+    // Set after the skip above, which reads the executable part again. Res stays 0: see PeekByte, this specific case
+    // may cause some executable memory to read as 0 but it doesn't matter as the entire instruction will be rolled back anyway.
+    HitNonExecutableRange = true;
+  }
 
   if (Relocations) {
     uint32_t SectionOffset = static_cast<uint32_t>(Address - SectionMinAddress);
@@ -1257,6 +1265,11 @@ void Decoder::BranchTargetInMultiblockRange() {
 
     AddBranchTarget(TargetRIP);
   } else {
+    // Code a conditional branch leaves the multiblock for, often a cold path placed far away, usually jumps back to the instruction
+    // after the branch. Make that an entry point, so the jump back runs this translation rather than translating from there again.
+    if (Conditional) {
+      BlockInfo.EntryPoints.emplace(InstEnd);
+    }
     if (ExternalBranches) {
       ExternalBranches->insert(TargetRIP);
     }
@@ -1601,6 +1614,14 @@ void Decoder::DecodeLoop(const uint8_t* _InstStream, uint64_t GuestSizePause) {
       BlocksToDecode.erase(BlockDecodeIt);
       VisitedBlocks.emplace(RIPToDecode);
 
+      // Leave code that is already translated as an exit, which block linking turns into a branch to that translation. Decoding it
+      // again would translate it twice: a branch back into a large multiblock would translate everything after it once more.
+      // The code caches need multiblocks that do not depend on what else ran before, so they keep decoding.
+      if (!EntryBlock && !WantsDataMasks && !CTX->RequiresRelocatableConstants() && Thread->LookupCache->FindBlock(Thread, RIPToDecode)) {
+        Paused = false;
+        continue;
+      }
+
       auto BlockSuccIt = std::lower_bound(BlockInfo.Blocks.begin(), BlockInfo.Blocks.end(), RIPToDecode,
                                           [](const auto& a, uint64_t Address) { return a.Entry < Address; });
 
@@ -1642,6 +1663,8 @@ void Decoder::DecodeLoop(const uint8_t* _InstStream, uint64_t GuestSizePause) {
 
     while (1) {
       InstructionSize = 0;
+      // The peeks below run before DecodeInstruction resets this, so the last block's NoExec must not leak into them.
+      HitNonExecutableRange = false;
 
       // MAX_INST_SIZE assumes worst case
       auto OpAddress = BlockIt->Entry + PCOffset;
@@ -1653,17 +1676,17 @@ void Decoder::DecodeLoop(const uint8_t* _InstStream, uint64_t GuestSizePause) {
       if (!EntryBlock && OpMinPage == OpMaxPage && PeekByte(0).value_or(0) == 0 && PeekByte(1).value_or(0) == 0) [[unlikely]] {
         // End the multiblock early if we hit 2 consecutive null bytes (add [rax], al) in the same page with the
         // assumption we are most likely trying to explore garbage code.
+        // Nothing is translated from these bytes, so their page doesn't need to be added (and protected) first.
         break;
       }
 
+      // Before any byte of the instruction is read
       if (OpMinPage != CurrentCodePage) {
-        CurrentCodePage = OpMinPage;
-        BlockInfo.CodePages.insert(CurrentCodePage);
+        AddCodePage(OpMinPage);
       }
 
       if (OpMaxPage != CurrentCodePage) {
-        CurrentCodePage = OpMaxPage;
-        BlockInfo.CodePages.insert(CurrentCodePage);
+        AddCodePage(OpMaxPage);
       }
 
       LastFieldReadSize = 0;
@@ -1807,7 +1830,18 @@ void Decoder::DecodeLoop(const uint8_t* _InstStream, uint64_t GuestSizePause) {
   }
 }
 
-void Decoder::SetupDecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thread, uint64_t PC, uint64_t MaxInst) {
+void Decoder::AddCodePage(uint64_t Page) {
+  CurrentCodePage = Page;
+  if (BlockInfo.CodePages.insert(Page).second && ProtectCodePages && !Thread->LookupCache->HasCodePage(Page)) {
+    // Protect the page before reading it, not after compiling: a write between the two would not fault, and the block would keep
+    // the old code. A write after this faults, and its invalidation waits for the compile to finish (CodeInvalidationMutex).
+    // If the decode produces no block, the page stays protected without code: the next compile protects it again, and a write
+    // takes one extra fault.
+    CTX->SyscallHandler->MarkGuestExecutableRange(Thread, Page, FEXCore::Utils::FEX_PAGE_SIZE);
+  }
+}
+
+void Decoder::SetupDecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thread, uint64_t PC, uint64_t MaxInst, bool Protect) {
   FEXCORE_PROFILE_SCOPED("DecodeInstructions");
   BlockInfo.TotalInstructionCount = 0;
   BlockInfo.Blocks.clear();
@@ -1856,9 +1890,9 @@ void Decoder::SetupDecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState*
   // Entry is a jump target
   BlocksToDecode = {PC};
 
-  CurrentCodePage = PC & FEXCore::Utils::FEX_PAGE_MASK;
-
-  BlockInfo.CodePages = {CurrentCodePage};
+  ProtectCodePages = Protect;
+  BlockInfo.CodePages.clear();
+  AddCodePage(PC & FEXCore::Utils::FEX_PAGE_MASK);
 
   EntryBlock = true;
   FinalInstruction = false;
