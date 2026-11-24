@@ -92,6 +92,8 @@ void RegisterStubs(FEX::HLE::SyscallHandler* Handler);
 
 uint64_t UnimplementedSyscall(FEXCore::Core::CpuStateFrame* Frame, uint64_t SyscallNumber);
 uint64_t UnimplementedSyscallSafe(FEXCore::Core::CpuStateFrame* Frame, uint64_t SyscallNumber);
+// ioctl on a userfaultfd (request type UFFDIO), for both guest ABIs.
+uint64_t UserfaultfdIoctl(int fd, uint32_t cmd, uint64_t arg);
 
 struct ExecveAtArgs {
   int dirfd;
