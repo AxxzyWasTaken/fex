@@ -1695,7 +1695,7 @@ void Decoder::DecodeLoop(const uint8_t* _InstStream, uint64_t GuestSizePause) {
 
       // MAX_INST_SIZE assumes worst case
       auto OpAddress = BlockIt->Entry + PCOffset;
-      auto OpMaxAddress = OpAddress + MAX_INST_SIZE;
+      auto OpMaxAddress = OpAddress + MAX_INST_SIZE - 1;
 
       auto OpMinPage = OpAddress & FEXCore::Utils::FEX_PAGE_MASK;
       auto OpMaxPage = OpMaxAddress & FEXCore::Utils::FEX_PAGE_MASK;
@@ -1709,11 +1709,11 @@ void Decoder::DecodeLoop(const uint8_t* _InstStream, uint64_t GuestSizePause) {
 
       // Before any byte of the instruction is read
       if (OpMinPage != CurrentCodePage) {
-        AddCodePage(OpMinPage);
+        ProtectCodePage(OpMinPage);
       }
 
       if (OpMaxPage != CurrentCodePage) {
-        AddCodePage(OpMaxPage);
+        ProtectCodePage(OpMaxPage);
       }
 
       LastFieldReadSize = 0;
@@ -1764,6 +1764,12 @@ void Decoder::DecodeLoop(const uint8_t* _InstStream, uint64_t GuestSizePause) {
           }
           EraseBlock = true;
         } else {
+          RecordCodePage(OpMinPage);
+          if (OpMaxPage != OpMinPage &&
+              (OpAddress + InstructionSize > OpMaxPage ||
+               (HitNonExecutableRange && OpAddress + InstructionSize >= OpMaxPage))) {
+            RecordCodePage(OpMaxPage);
+          }
           LogMan::Msg::EFmt("{} instruction in entry block: {:X}",
                             BlockIt->BlockStatus == DecodedBlockStatus::BREAKPOINT_0       ? "Breakpoint" :
                             BlockIt->BlockStatus == DecodedBlockStatus::BREAKPOINT_1       ? "Breakpoint" :
@@ -1777,6 +1783,11 @@ void Decoder::DecodeLoop(const uint8_t* _InstStream, uint64_t GuestSizePause) {
                             OpAddress);
         }
         break;
+      }
+
+      RecordCodePage(OpMinPage);
+      if (OpMaxPage != OpMinPage && OpAddress + InstructionSize > OpMaxPage) {
+        RecordCodePage(OpMaxPage);
       }
 
       if (GuestSizePause) {
@@ -1857,14 +1868,21 @@ void Decoder::DecodeLoop(const uint8_t* _InstStream, uint64_t GuestSizePause) {
   }
 }
 
-void Decoder::AddCodePage(uint64_t Page) {
+void Decoder::ProtectCodePage(uint64_t Page) {
   CurrentCodePage = Page;
-  if (BlockInfo.CodePages.insert(Page).second && ProtectCodePages && !Thread->LookupCache->HasCodePage(Page)) {
+  if (ProtectCodePages && ProtectedCodePages.insert(Page).second && !Thread->LookupCache->HasCodePage(Page)) {
     // Protect the page before reading it, not after compiling: a write between the two would not fault, and the block would keep
     // the old code. A write after this faults, and its invalidation waits for the compile to finish (CodeInvalidationMutex).
     // If the decode produces no block, the page stays protected without code: the next compile protects it again, and a write
     // takes one extra fault.
     CTX->SyscallHandler->MarkGuestExecutableRange(Thread, Page, FEXCore::Utils::FEX_PAGE_SIZE);
+  }
+}
+
+void Decoder::RecordCodePage(uint64_t Page) {
+  if (Page != LastRecordedCodePage) {
+    BlockInfo.CodePages.insert(Page);
+    LastRecordedCodePage = Page;
   }
 }
 
@@ -1919,7 +1937,10 @@ void Decoder::SetupDecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState*
 
   ProtectCodePages = Protect;
   BlockInfo.CodePages.clear();
-  AddCodePage(PC & FEXCore::Utils::FEX_PAGE_MASK);
+  ProtectedCodePages.clear();
+  CurrentCodePage = ~0ULL;
+  LastRecordedCodePage = ~0ULL;
+  ProtectCodePage(PC & FEXCore::Utils::FEX_PAGE_MASK);
 
   EntryBlock = true;
   FinalInstruction = false;

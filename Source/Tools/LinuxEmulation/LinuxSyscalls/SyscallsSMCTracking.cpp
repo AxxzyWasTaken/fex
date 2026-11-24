@@ -380,6 +380,7 @@ void SyscallHandler::MarkGuestExecutableRange(FEXCore::Core::InternalThreadState
 
     auto lk = FEXCore::GuardSignalDeferringSection<std::shared_lock>(VMATracking.Mutex, Thread);
     std::shared_lock InlineLock(InlineSMCMutex);
+    const bool ReadImpliesExec = Thread && (FEX::HLE::ThreadManager::GetStateObjectFromFEXCoreThread(Thread)->persona & READ_IMPLIES_EXEC);
 
     // Find the first mapping at or after the range ends, or ::end().
     // Top points to the address after the end of the range
@@ -395,6 +396,11 @@ void SyscallHandler::MarkGuestExecutableRange(FEXCore::Core::InternalThreadState
         // Mapping ends before the Range start, exit
         break;
       } else {
+        const bool Decodable = Mapping->second.Prot.Executable || (ReadImpliesExec && Mapping->second.Prot.Readable);
+        if (!Decodable) {
+          continue;
+        }
+
         const auto ProtectBase = std::max(MapBase, Base);
         const auto ProtectSize = std::min(MapTop, Top) - ProtectBase;
 
