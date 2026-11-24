@@ -1204,20 +1204,22 @@ void ContextImpl::RetireOldCodeBuffers(FEXCore::Core::InternalThreadState* Threa
 #endif
 }
 
-void ContextImpl::InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length) {
+bool ContextImpl::InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length) {
   FEXCORE_PROFILE_SCOPED("InvalidateCodeBuffersCodeRange");
 
   LOGMAN_THROW_A_FMT(CodeInvalidationMutex.try_lock() == false, "CodeInvalidationMutex needs to be unique_locked here");
+  bool Invalidated = false;
   std::scoped_lock lk {CodeBufferListLock};
   auto it = CodeBufferList.begin();
   while (it != CodeBufferList.end()) {
     if (auto Strong = it->lock()) {
-      Strong->LookupCache->InvalidateRange(Start, Length);
+      Invalidated |= Strong->LookupCache->InvalidateRange(Start, Length);
       it++;
     } else {
       it = CodeBufferList.erase(it);
     }
   }
+  return Invalidated;
 }
 
 void ContextImpl::InvalidateThreadCachedCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) {

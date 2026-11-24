@@ -130,11 +130,12 @@ struct GuestToHostMap {
     return BlockList.erase(Address) != 0;
   }
 
-  void InvalidateRange(uint64_t Start, uint64_t Length) {
+  bool InvalidateRange(uint64_t Start, uint64_t Length) {
     auto lk = AcquireWriteLock();
 
     auto lower = CodePages.lower_bound(Start >> 12);
     auto upper = CodePages.upper_bound((Start + Length - 1) >> 12);
+    const bool HadEntries = lower != upper;
 
     for (auto it = lower; it != upper; it++) {
       for (const auto& Entry : it->second) {
@@ -142,6 +143,7 @@ struct GuestToHostMap {
       }
     }
     CodePages.erase(lower, upper);
+    return HadEntries;
   }
 
   void AddBlockLink(uint64_t GuestDestination, FEXCore::Context::ExitFunctionLinkData* HostLink,
