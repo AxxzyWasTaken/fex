@@ -250,6 +250,19 @@ void Dispatcher::EmitDispatcher() {
     ret();
   }
 
+  [[maybe_unused]] auto EmitPendingInterruptFaultCheck = [&]() {
+    // Trigger segfault if any deferred signals are pending
+    constexpr size_t InterruptPageOffset =
+      offsetof(FEXCore::Core::InternalThreadState, InterruptFaultPage) - offsetof(FEXCore::Core::InternalThreadState, BaseFrameState);
+    if constexpr (InterruptPageOffset <= 32760) {
+      str(ARMEmitter::XReg::zr, STATE, InterruptPageOffset);
+    } else {
+      // Need to use vector 128-bit store for this range.
+      // Doesn't matter which register we use to store.
+      str(ARMEmitter::QReg::q0, STATE, InterruptPageOffset);
+    }
+  };
+
   // Clobbers TMP1/2
   auto EmitSignalGuardedRegion = [&](auto Body) {
 #ifndef _WIN32
@@ -276,16 +289,7 @@ void Dispatcher::EmitDispatcher() {
     sub(ARMEmitter::Size::i64Bit, TMP2, TMP2, 1);
     str(TMP2, STATE, offsetof(FEXCore::Core::CPUState, DeferredSignalRefCount));
 
-    // Trigger segfault if any deferred signals are pending
-    constexpr size_t InterruptPageOffset =
-      offsetof(FEXCore::Core::InternalThreadState, InterruptFaultPage) - offsetof(FEXCore::Core::InternalThreadState, BaseFrameState);
-    if constexpr (InterruptPageOffset <= 32760) {
-      str(ARMEmitter::XReg::zr, STATE, InterruptPageOffset);
-    } else {
-      // Need to use vector 128-bit store for this range.
-      // Doesn't matter which register we use to store.
-      str(ARMEmitter::QReg::q0, STATE, InterruptPageOffset);
-    }
+    EmitPendingInterruptFaultCheck();
 #endif
   };
 
@@ -577,6 +581,12 @@ void Dispatcher::EmitDispatcher() {
     // This gives the signal handler a value to check to see if we are in a syscall at all
     LoadConstant(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r0, 0xFFFF);
     str(ARMEmitter::XReg::x0, STATE, offsetof(FEXCore::Core::CpuStateFrame, InSyscallInfo));
+
+    if (CTX->Config.NeedsPendingInterruptFaultCheck) {
+      // Take pending signals before the syscall, which may block. Signals that arrive from here on are taken right away, as
+      // the thread is marked as in a syscall. The guest state is all in the frame.
+      EmitPendingInterruptFaultCheck();
+    }
 
     ldr(ARMEmitter::XReg::x0, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.SyscallHandlerObj));
     ldr(ARMEmitter::XReg::x3, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.SyscallHandlerFunc));
