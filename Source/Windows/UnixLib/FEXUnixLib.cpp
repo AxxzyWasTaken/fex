@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 #include <cstdint>
+#include <cstring>
 #include <type_traits>
 #include <fcntl.h>
 #include <string>
@@ -194,6 +195,15 @@ static NTSTATUS FEXUnixLib_MapFileHandler(void* _Args) {
 }
 
 static NTSTATUS FEXUnixLib_GetPIDHandler(void* _Args) {
+  uint32_t Magic {};
+  std::memcpy(&Magic, _Args, sizeof(Magic));
+  if (Magic == FEX_UNIXLIB_QUERY_MAGIC) {
+    auto Query = reinterpret_cast<FEXUnixLib_GetPIDQuery*>(_Args);
+    Query->Result = ::getpid();
+    Query->MaxFunction = ToUnderlying(FEXUnixLibFunctions::MAX);
+    return STATUS_SUCCESS;
+  }
+
   auto Args = reinterpret_cast<FEXUnixLib_GetPID*>(_Args);
   Args->Result = ::getpid();
   return STATUS_SUCCESS;
@@ -216,6 +226,26 @@ static NTSTATUS FEXUnixLib_EnableAPFLGHandler(void*) {
 #endif
 }
 
+static NTSTATUS FEXUnixLib_SetAPFLGControlHandler(void* _Args) {
+#ifdef __aarch64__
+  if (!_Args) {
+    return STATUS_NOT_SUPPORTED;
+  }
+  auto Args = reinterpret_cast<const FEXUnixLib_SetAPFLGControlArgs*>(_Args);
+  if (Args->Enable) {
+    if (!(getauxval(AT_HWCAP3) & HWCAP3_APPLE_APFLG)) {
+      return STATUS_NOT_SUPPORTED;
+    }
+    return prctl(PR_AURORA_SET_X86_FLAGS, 1, 0, 0, 0) == 0 ? STATUS_SUCCESS : STATUS_NOT_SUPPORTED;
+  }
+
+  return prctl(PR_AURORA_SET_X86_FLAGS, 0, 0, 0, 0) == 0 ? STATUS_SUCCESS : STATUS_INTERNAL_ERROR;
+#else
+  (void)_Args;
+  return STATUS_NOT_SUPPORTED;
+#endif
+}
+
 extern "C" const unixlib_entry_t __wine_unix_call_funcs[] = {
   FEXUnixLib_SetHardwareTSOControlHandler,
   FEXUnixLib_SetKernelUnalignedAtomicControlHandler,
@@ -227,6 +257,7 @@ extern "C" const unixlib_entry_t __wine_unix_call_funcs[] = {
   FEXUnixLib_GetPIDHandler,
   FEXUnixLib_CheckSupportsTPIDRRO_CPUHandler,
   FEXUnixLib_EnableAPFLGHandler,
+  FEXUnixLib_SetAPFLGControlHandler,
 };
 
 static_assert(sizeof(__wine_unix_call_funcs) / sizeof(__wine_unix_call_funcs[0]) == ToUnderlying(FEXUnixLibFunctions::MAX));
