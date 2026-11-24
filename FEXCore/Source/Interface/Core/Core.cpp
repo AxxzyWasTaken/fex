@@ -1207,7 +1207,9 @@ void ContextImpl::RetireOldCodeBuffers(FEXCore::Core::InternalThreadState* Threa
 bool ContextImpl::InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length) {
   FEXCORE_PROFILE_SCOPED("InvalidateCodeBuffersCodeRange");
 
+#if defined(ASSERTIONS_ENABLED) && ASSERTIONS_ENABLED
   LOGMAN_THROW_A_FMT(CodeInvalidationMutex.try_lock() == false, "CodeInvalidationMutex needs to be unique_locked here");
+#endif
   bool Invalidated = false;
   std::scoped_lock lk {CodeBufferListLock};
   auto it = CodeBufferList.begin();
@@ -1223,7 +1225,9 @@ bool ContextImpl::InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length
 }
 
 void ContextImpl::InvalidateThreadCachedCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) {
+#if defined(ASSERTIONS_ENABLED) && ASSERTIONS_ENABLED
   LOGMAN_THROW_A_FMT(CodeInvalidationMutex.try_lock() == false, "CodeInvalidationMutex needs to be unique_locked here");
+#endif
 
   // Ensures now-modified mappings aren't cached as being in their previous non-executable state.
   // Accessing FrontendDecoder is safe as the thread's code invalidation mutex must be locked here.
@@ -1303,13 +1307,17 @@ void ContextImpl::AddThunkTrampolineIRHandler(uintptr_t Entrypoint, uintptr_t Gu
 }
 
 void ContextImpl::AddForceTSOInformation(const IntervalList<uint64_t>& ValidRanges, fextl::set<uint64_t>&& Instructions) {
+#if defined(ASSERTIONS_ENABLED) && ASSERTIONS_ENABLED
   LogMan::Throw::AFmt(CodeInvalidationMutex.try_lock() == false, "CodeInvalidationMutex needs to be unique_locked here");
+#endif
   ForceTSOValidRanges.Insert(ValidRanges);
   ForceTSOInstructions.merge(std::move(Instructions));
 }
 
 void ContextImpl::RemoveForceTSOInformation(uint64_t Address, uint64_t Size) {
+#if defined(ASSERTIONS_ENABLED) && ASSERTIONS_ENABLED
   LogMan::Throw::AFmt(CodeInvalidationMutex.try_lock() == false, "CodeInvalidationMutex needs to be unique_locked here");
+#endif
 
   ForceTSOValidRanges.Remove({Address, Address + Size});
   ForceTSOInstructions.erase(ForceTSOInstructions.lower_bound(Address), ForceTSOInstructions.upper_bound(Address + Size));
