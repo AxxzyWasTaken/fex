@@ -23,6 +23,8 @@ class ContextImpl;
 namespace FEXCore::Frontend {
 class Decoder final {
 public:
+  static constexpr size_t MAX_INST_SIZE = 15;
+
   enum class DecodedBlockStatus {
     SUCCESS,
     INVALID_INST,
@@ -195,7 +197,6 @@ private:
     return BlockInfo.Is64BitMode ? IR::OpSize::i64Bit : IR::OpSize::i32Bit;
   }
 
-  static constexpr size_t MAX_INST_SIZE = 15;
   uint8_t InstructionSize {};
   // Contains the full decoded instruction, unless it is a `Thunk` instruction.
   std::array<uint8_t, MAX_INST_SIZE> Instruction;

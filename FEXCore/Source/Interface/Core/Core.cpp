@@ -700,15 +700,18 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
           Thread->OpDispatcher->_GuestOpcode(InstAddress - GuestRIP);
         }
 
-        if (Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL || Block.ForceFullSMCDetection) {
+        const uint8_t ValidateSize = DecodedInfo->ValidateSize;
+        if ((Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL || Block.ForceFullSMCDetection) && ValidateSize != 0) {
           auto ExistingCodePtr = reinterpret_cast<uint8_t*>(Block.Entry + BlockInstructionsLength);
           auto InstAddressReg = Thread->OpDispatcher->_EntrypointOffset(GPRSize, InstAddress - GuestRIP);
 
-          auto Value = FEXCore::Utils::crc32(ExistingCodePtr, DecodedInfo->InstSize);
-          auto CRC = WantsDiskCachePatching ?
-                       Thread->OpDispatcher->_PatchableGuestCRC(IR::OpSize::i64Bit, Value, (int64_t)ExistingCodePtr, DecodedInfo->InstSize) :
+          auto Value = ValidateSize <= FEXCore::Frontend::Decoder::MAX_INST_SIZE ?
+                         DecodedInfo->InstCRC :
+                         FEXCore::Utils::crc32(ExistingCodePtr, ValidateSize);
+          auto CRC = (WantsDiskCachePatching && !Block.ForceFullSMCDetection) ?
+                       Thread->OpDispatcher->_PatchableGuestCRC(IR::OpSize::i64Bit, Value, (int64_t)ExistingCodePtr, ValidateSize) :
                        Thread->OpDispatcher->Constant(Value);
-          auto CodeChanged = Thread->OpDispatcher->_ValidateCode(CRC, InstAddressReg, DecodedInfo->InstSize);
+          auto CodeChanged = Thread->OpDispatcher->_ValidateCode(CRC, InstAddressReg, ValidateSize);
 
           auto InvalidateCodeCond = Thread->OpDispatcher->CondJump(CodeChanged);
 

@@ -11,6 +11,7 @@ $end_info$
 #include "Interface/Core/OpcodeDispatcher.h"
 #include "Interface/Core/X86Tables/X86Tables.h"
 #include "Interface/Core/LookupCache.h"
+#include "Utils/crc32.h"
 
 #include <array>
 #include <algorithm>
@@ -170,23 +171,26 @@ std::pair<uint64_t, bool> Decoder::ReadData(uint8_t Size) {
   LastFieldReadOffset = (uint8_t)InstructionSize;
   LastFieldReadSize = Size;
   auto ReadableSize = CheckRangeExecutable(Address, Size);
+  const size_t BytesRead = static_cast<size_t>(std::abs(ReadableSize));
   if (ReadableSize == Size) {
     std::memcpy(&Res, &InstStream.AdjustedInstStream[InstructionSize], Size);
+    if (InstructionSize < MAX_INST_SIZE) {
+      std::memcpy(&Instruction[InstructionSize], &Res, std::min<size_t>(Size, MAX_INST_SIZE - InstructionSize));
+    }
+  } else if (BytesRead > 0 && Address + Size >= Address && InstructionSize < MAX_INST_SIZE) {
+    // Copy the readable prefix into Instruction so InstCRC on PARTIAL_DECODE_INST matches the
+    // bytes validated by _ValidateCode, without double-reading live memory.
+    const size_t CopySize = std::min<size_t>({BytesRead, static_cast<size_t>(Size), MAX_INST_SIZE - InstructionSize});
+    std::memcpy(&Instruction[InstructionSize], &InstStream.AdjustedInstStream[InstructionSize], CopySize);
   }
 
   // Skip the number of decoded bytes regardless to get instruction size.
   // Even partially decoded instruction.
-#if defined(ASSERTIONS_ENABLED) && ASSERTIONS_ENABLED
-  for (size_t i = 0; i < std::abs(ReadableSize); ++i) {
-    ReadByte();
-  }
-#else
-  SkipBytes(std::abs(ReadableSize));
-#endif
+  SkipBytes(BytesRead);
 
   if (ReadableSize != Size) {
-    // Set after the skip above, which reads the executable part again. Res stays 0: see PeekByte, this specific case
-    // may cause some executable memory to read as 0 but it doesn't matter as the entire instruction will be rolled back anyway.
+    // Res stays 0: see PeekByte, this specific case may cause some executable memory to read as 0
+    // but it doesn't matter as the entire instruction will be rolled back anyway.
     HitNonExecutableRange = true;
   }
 
@@ -699,6 +703,12 @@ Decoder::DecodedBlockStatus Decoder::NormalOp(const FEXCore::X86Tables::X86InstI
   LOGMAN_THROW_A_FMT(Bytes == 0, "Inst at 0x{:x}: 0x{:04x} '{}' Had an instruction of size {} with {} remaining", DecodeInst->PC,
                      DecodeInst->OP, DecodeInst->TableInfo->Name ?: "UND", InstructionSize, Bytes);
   DecodeInst->InstSize = InstructionSize;
+  DecodeInst->ValidateSize = InstructionSize;
+  if (InstructionSize <= MAX_INST_SIZE) {
+    DecodeInst->InstCRC = FEXCore::Utils::crc32(Instruction.data(), InstructionSize);
+  } else {
+    DecodeInst->InstCRC = 0;
+  }
   return DecodedBlockStatus::SUCCESS;
 }
 
@@ -1136,6 +1146,13 @@ Decoder::DecodedBlockStatus Decoder::DecodeInstruction(uint64_t PC) {
     // A decode error can be caused by substituting zero for an inaccessible
     // instruction byte, so the instruction fetch fault takes priority.
     if (HitNonExecutableRange) {
+      // Populate ValidateSize/InstCRC from the consumed readable prefix bytes so a
+      // cached fault block on a promoted inline-SMC page still invalidates if those
+      // executable prefix bytes are patched (whether PARTIAL_DECODE_INST or an
+      // early-return NOEXEC_INST after consuming prefix/escape bytes).
+      const uint8_t ValidateSize = static_cast<uint8_t>(std::min<size_t>(InstructionSize, MAX_INST_SIZE));
+      DecodeInst->ValidateSize = ValidateSize;
+      DecodeInst->InstCRC = ValidateSize ? FEXCore::Utils::crc32(Instruction.data(), ValidateSize) : 0;
       return DecodeInst->InstSize ? DecodedBlockStatus::PARTIAL_DECODE_INST : DecodedBlockStatus::NOEXEC_INST;
     }
 
@@ -1143,8 +1160,17 @@ Decoder::DecodedBlockStatus Decoder::DecodeInstruction(uint64_t PC) {
     DecodeInst->InstSize = 0;
 
     if (HitBadRelocation) {
+      DecodeInst->ValidateSize = 0;
+      DecodeInst->InstCRC = 0;
       return DecodedBlockStatus::BAD_RELOCATION;
     }
+
+    // Retain the consumed byte count and CRC for inline SMC validation so a guest SIGILL
+    // handler patching an invalid/unimplemented instruction on an inline-SMC page invalidates
+    // this cached InvalidOp block on resume.
+    const uint8_t ValidateSize = static_cast<uint8_t>(std::min<size_t>(InstructionSize, MAX_INST_SIZE));
+    DecodeInst->ValidateSize = ValidateSize;
+    DecodeInst->InstCRC = ValidateSize ? FEXCore::Utils::crc32(Instruction.data(), ValidateSize) : 0;
 
     return ErrorDuringDecoding;
   } else if (!DecodeInst->TableInfo || (DecodeInst->TableInfo->Type == TYPE_INST && !DecodeInst->TableInfo->OpcodeDispatcher.OpDispatch)) {
