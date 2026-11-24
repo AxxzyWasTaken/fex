@@ -187,7 +187,7 @@ bool CPUFeatures::HandleAPFLGProbeException(const EXCEPTION_RECORD* Exception, A
   NativeContext->Cpsr &= ~Probe->ExpectedBits;
   NativeContext->Pc = Probe->FailPc;
   ContinueFn(NativeContext, FALSE);
-  return true;
+  ERROR_AND_DIE_FMT("FEX: Failed to resume after Wine APFLG CPSR probe exception");
 }
 
 __attribute__((noinline)) bool CPUFeatures::ProbeWineAPFLGExceptionRoundTrip() {
