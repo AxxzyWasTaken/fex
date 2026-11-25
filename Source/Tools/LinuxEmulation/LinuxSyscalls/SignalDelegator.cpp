@@ -1209,20 +1209,22 @@ void SignalDelegator::RegisterTLSState(FEX::HLE::ThreadStateObject* Thread) {
 }
 
 void SignalDelegator::UninstallTLSState(FEX::HLE::ThreadStateObject* Thread) {
-  FEXCore::Allocator::munmap(Thread->SignalInfo.AltStackPtr, SIGSTKSZ * 16);
-
-  Thread->SignalInfo.AltStackPtr = nullptr;
-
   stack_t altstack {};
   altstack.ss_flags = SS_DISABLE;
 
-  // Uninstall the alt stack
+  // Uninstall the alt stack before unmapping its backing memory.
   const int Result = sigaltstack(&altstack, nullptr);
   if (Result == -1) {
     LogMan::Msg::EFmt("Failed to uninstall alternative signal stack {}", strerror(errno));
   }
 
+  // Clear allocator TLS before munmap so the 64-bit allocator's DeferredSignalRefCountGuard
+  // cannot touch InterruptFaultPage while SIGSEGV is raw-masked on thread exit.
   FEXCore::Allocator::UninstallTLSData(Thread->Thread);
+
+  FEXCore::Allocator::munmap(Thread->SignalInfo.AltStackPtr, SIGSTKSZ * 16);
+
+  Thread->SignalInfo.AltStackPtr = nullptr;
 }
 
 void SignalDelegator::InstallOrUpdateRequiredHostThunk(int Signal, bool Required) {
