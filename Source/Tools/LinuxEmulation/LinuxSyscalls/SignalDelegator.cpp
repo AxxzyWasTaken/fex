@@ -469,7 +469,7 @@ bool SignalDelegator::HandleSIGILL(FEXCore::Core::InternalThreadState* Thread, i
     // We use this to track if it is safe to clear cache
     --Thread->CurrentFrame->SignalHandlerRefCounter;
 
-    if (ThreadObject->SignalInfo.DeferredSignalFrames.size() != 0) {
+    if (ThreadObject->SignalInfo.DeferredSignalFrameCount != 0) {
       // If we have more deferred frames to process then mprotect back to PROT_NONE.
       // It will have been RW coming in to this sigreturn and now we need to remove permissions
       // to ensure FEX trampolines back to the SIGSEGV deferred handler.
@@ -668,18 +668,17 @@ void SignalDelegator::HandleGuestSignal(FEX::HLE::ThreadStateObject* ThreadObjec
 
       mprotect(reinterpret_cast<void*>(&Thread->InterruptFaultPage), sizeof(Thread->InterruptFaultPage), PROT_READ | PROT_WRITE);
 
-      if (ThreadObject->SignalInfo.DeferredSignalFrames.empty()) {
+      if (ThreadObject->SignalInfo.DeferredSignalFrameCount == 0) {
         // No signals to defer. Just set the fault page back to RW and continue execution.
         // This occurs as a minor race condition between the refcount decrement and the access to the fault page.
         return;
       }
 
-      const auto& Top = ThreadObject->SignalInfo.DeferredSignalFrames.back();
+      const auto Top = ThreadObject->SignalInfo.DeferredSignalFrames[--ThreadObject->SignalInfo.DeferredSignalFrameCount];
       Signal = Top.Signal;
       SigInfo = Top.Info;
       // sig mask has been updated at the defer time, recover the original mask
       memcpy(&_context->uc_sigmask, &Top.SigMask, sizeof(uint64_t));
-      ThreadObject->SignalInfo.DeferredSignalFrames.pop_back();
 
       // Until we re-protect the page to PROT_NONE, FEX will now *permanently* defer signals and /not/ check them.
       //
@@ -705,20 +704,33 @@ void SignalDelegator::HandleGuestSignal(FEX::HLE::ThreadStateObject* ThreadObjec
   } else if (IsAsyncSignal(&SigInfo, Signal) && (MustDeferSignal || BetweenChecks)) {
     // If the signal is asynchronous (as determined by si_code) and FEX is in a state of needing
     // to defer the signal, then add the signal to the thread's signal queue.
-    LOGMAN_THROW_A_FMT(ThreadObject->SignalInfo.DeferredSignalFrames.size() != ThreadObject->SignalInfo.DeferredSignalFrames.capacity(),
-                       "Deferred signals vector hit "
-                       "capacity size. This will "
-                       "likely crash! Asserting now!");
+    // Standard (non-realtime) signals (1..31) do not queue on Linux: coalesce duplicates
+    // (which can arrive with SA_NODEFER) instead of consuming additional slots.
+    constexpr int LINUX_SIGRTMIN = 32;
+    if (Signal < LINUX_SIGRTMIN) {
+      for (size_t i = 0; i < ThreadObject->SignalInfo.DeferredSignalFrameCount; ++i) {
+        if (ThreadObject->SignalInfo.DeferredSignalFrames[i].Signal == Signal) {
+          return;
+        }
+      }
+    }
+
+    // Never allocate inside a signal handler. If the fixed queue is full, record as pending
+    // without altering uc_sigmask so the signal mask cannot leak.
+    if (ThreadObject->SignalInfo.DeferredSignalFrameCount >= ThreadStateObject::MAX_DEFERRED_SIGNALS) {
+      ThreadObject->SignalInfo.PendingSignals |= 1ULL << (Signal - 1);
+      return;
+    }
 
     // Peek into sigset_t implementation details, extracting the __val member for glibc and __bits for musl
     auto& [sigmask_val] = _context->uc_sigmask;
     static_assert(sizeof(sigmask_val[0]) == sizeof(uint64_t), "Unknown sigset_t layout");
 
-    ThreadObject->SignalInfo.DeferredSignalFrames.emplace_back(ThreadStateObject::DeferredSignalState {
+    ThreadObject->SignalInfo.DeferredSignalFrames[ThreadObject->SignalInfo.DeferredSignalFrameCount++] = ThreadStateObject::DeferredSignalState {
       .Info = SigInfo,
       .Signal = Signal,
       .SigMask = sigmask_val[0],
-    });
+    };
 
     // Update our host signal mask so we don't hit race conditions with signals
     // This allows us to maintain the expected signal mask through the guest signal handling and then all the way back again
@@ -1097,12 +1109,6 @@ void SignalDelegator::RegisterTLSState(FEX::HLE::ThreadStateObject* Thread) {
 
   // Get the current host signal mask
   ::syscall(SYS_rt_sigprocmask, 0, nullptr, &Thread->SignalInfo.CurrentSignalMask.Val, 8);
-
-  if (Thread->Thread) {
-    // Reserve a small amount of deferred signal frames. Usually the stack won't be utilized beyond
-    // 1 or 2 signals but add a few more just in case.
-    Thread->SignalInfo.DeferredSignalFrames.reserve(8);
-  }
 }
 
 void SignalDelegator::UninstallTLSState(FEX::HLE::ThreadStateObject* Thread) {

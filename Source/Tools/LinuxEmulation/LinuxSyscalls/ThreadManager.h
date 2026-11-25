@@ -22,6 +22,7 @@ $end_info$
 #include <FEXCore/Utils/Threads.h>
 #include <FEXCore/Utils/TypeDefines.h>
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstddef>
@@ -52,6 +53,7 @@ struct ThreadStateObject : public FEXCore::Allocator::FEXAllocOperators {
     int Signal;
     uint64_t SigMask;
   };
+  static constexpr size_t MAX_DEFERRED_SIGNALS = 64;
 
   FEXCore::Core::InternalThreadState* Thread;
 
@@ -81,8 +83,10 @@ struct ThreadStateObject : public FEXCore::Allocator::FEXAllocOperators {
     uint64_t PendingSignals {};
 
     // Queue of thread local signal frames that have been deferred.
+    // Fixed-capacity inline storage avoids heap allocation inside a signal handler.
     // Async signals aren't guaranteed to be delivered in any particular order, but FEX treats them as FILO.
-    fextl::vector<DeferredSignalState> DeferredSignalFrames;
+    std::array<DeferredSignalState, MAX_DEFERRED_SIGNALS> DeferredSignalFrames {};
+    size_t DeferredSignalFrameCount {};
   } SignalInfo {};
 
   // Seccomp thread specific data.
