@@ -21,6 +21,7 @@ namespace FEX::ArchHelpers::Context {
 enum ContextFlags : uint32_t {
   CONTEXT_FLAG_INJIT = (1U << 0),
   CONTEXT_FLAG_INDISPATCHER = (1U << 1),
+  CONTEXT_FLAG_FPR_IN_UCONTEXT = (1U << 2),
 };
 
 #if defined(ASSERTIONS_ENABLED) && ASSERTIONS_ENABLED
@@ -186,6 +187,16 @@ static inline __uint128_t* GetArmFPRs(void* ucontext) {
   LOGMAN_THROW_A_FMT(HostState->Head.Magic == FPR_MAGIC, "Wrong FPR Magic: 0x{:08x}", HostState->Head.Magic);
 
   return &HostState->FPRs[0];
+}
+
+static inline void ClearArmAFP(void* ucontext) {
+  auto MContext = GetMContext(ucontext);
+  HostFPRState* HostState = reinterpret_cast<HostFPRState*>(&MContext->__reserved[0]);
+  LOGMAN_THROW_A_FMT(HostState->Head.Magic == FPR_MAGIC, "Wrong FPR Magic: 0x{:08x}", HostState->Head.Magic);
+
+  // Clear FPCR.NEP (bit 2), FPCR.AH (bit 1), and FPCR.FIZ (bit 0) before returning to host C++.
+  constexpr uint32_t AFPBits = (1U << 2) | (1U << 1) | (1U << 0);
+  HostState->FPCR &= ~AFPBits;
 }
 
 static inline uint64_t GetArmESR(void* ucontext) {
