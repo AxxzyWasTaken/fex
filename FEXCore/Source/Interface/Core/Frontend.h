@@ -23,6 +23,8 @@ class ContextImpl;
 namespace FEXCore::Frontend {
 class Decoder final {
 public:
+  static constexpr size_t MAX_INST_SIZE = 15;
+
   enum class DecodedBlockStatus {
     SUCCESS,
     INVALID_INST,
@@ -126,7 +128,8 @@ private:
   // Negative: Number of bytes that failed to decode.
   int32_t CheckRangeExecutable(uint64_t Address, uint64_t Size);
 
-  void AddCodePage(uint64_t Page);
+  void ProtectCodePage(uint64_t Page);
+  void RecordCodePage(uint64_t Page);
 
   uint8_t ReadByte();
   std::optional<uint8_t> PeekByte(uint8_t Offset);
@@ -146,8 +149,10 @@ private:
   Utils::PoolBufferWithTimedRetirement<FEXCore::X86Tables::DecodedInst*, 5000, 500> PoolObject;
   size_t DecodedSize {};
   uint64_t TotalInstructions {};
-  uint64_t CurrentCodePage {};
+  uint64_t CurrentCodePage {~0ULL};
+  uint64_t LastRecordedCodePage {~0ULL};
   bool ProtectCodePages {};
+  fextl::set<uint64_t> ProtectedCodePages;
   bool EntryBlock {};
   bool FinalInstruction {};
   uint64_t MaxInst {};
@@ -195,7 +200,6 @@ private:
     return BlockInfo.Is64BitMode ? IR::OpSize::i64Bit : IR::OpSize::i32Bit;
   }
 
-  static constexpr size_t MAX_INST_SIZE = 15;
   uint8_t InstructionSize {};
   // Contains the full decoded instruction, unless it is a `Thunk` instruction.
   std::array<uint8_t, MAX_INST_SIZE> Instruction;

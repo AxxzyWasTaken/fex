@@ -11,6 +11,7 @@ $end_info$
 #include "Interface/Core/OpcodeDispatcher.h"
 #include "Interface/Core/X86Tables/X86Tables.h"
 #include "Interface/Core/LookupCache.h"
+#include "Utils/crc32.h"
 
 #include <array>
 #include <algorithm>
@@ -170,23 +171,26 @@ std::pair<uint64_t, bool> Decoder::ReadData(uint8_t Size) {
   LastFieldReadOffset = (uint8_t)InstructionSize;
   LastFieldReadSize = Size;
   auto ReadableSize = CheckRangeExecutable(Address, Size);
+  const size_t BytesRead = static_cast<size_t>(std::abs(ReadableSize));
   if (ReadableSize == Size) {
     std::memcpy(&Res, &InstStream.AdjustedInstStream[InstructionSize], Size);
+    if (InstructionSize < MAX_INST_SIZE) {
+      std::memcpy(&Instruction[InstructionSize], &Res, std::min<size_t>(Size, MAX_INST_SIZE - InstructionSize));
+    }
+  } else if (BytesRead > 0 && Address + Size >= Address && InstructionSize < MAX_INST_SIZE) {
+    // Copy the readable prefix into Instruction so InstCRC on PARTIAL_DECODE_INST matches the
+    // bytes validated by _ValidateCode, without double-reading live memory.
+    const size_t CopySize = std::min<size_t>({BytesRead, static_cast<size_t>(Size), MAX_INST_SIZE - InstructionSize});
+    std::memcpy(&Instruction[InstructionSize], &InstStream.AdjustedInstStream[InstructionSize], CopySize);
   }
 
   // Skip the number of decoded bytes regardless to get instruction size.
   // Even partially decoded instruction.
-#if defined(ASSERTIONS_ENABLED) && ASSERTIONS_ENABLED
-  for (size_t i = 0; i < std::abs(ReadableSize); ++i) {
-    ReadByte();
-  }
-#else
-  SkipBytes(std::abs(ReadableSize));
-#endif
+  SkipBytes(BytesRead);
 
   if (ReadableSize != Size) {
-    // Set after the skip above, which reads the executable part again. Res stays 0: see PeekByte, this specific case
-    // may cause some executable memory to read as 0 but it doesn't matter as the entire instruction will be rolled back anyway.
+    // Res stays 0: see PeekByte, this specific case may cause some executable memory to read as 0
+    // but it doesn't matter as the entire instruction will be rolled back anyway.
     HitNonExecutableRange = true;
   }
 
@@ -699,6 +703,12 @@ Decoder::DecodedBlockStatus Decoder::NormalOp(const FEXCore::X86Tables::X86InstI
   LOGMAN_THROW_A_FMT(Bytes == 0, "Inst at 0x{:x}: 0x{:04x} '{}' Had an instruction of size {} with {} remaining", DecodeInst->PC,
                      DecodeInst->OP, DecodeInst->TableInfo->Name ?: "UND", InstructionSize, Bytes);
   DecodeInst->InstSize = InstructionSize;
+  DecodeInst->ValidateSize = InstructionSize;
+  if (InstructionSize <= MAX_INST_SIZE) {
+    DecodeInst->InstCRC = FEXCore::Utils::crc32(Instruction.data(), InstructionSize);
+  } else {
+    DecodeInst->InstCRC = 0;
+  }
   return DecodedBlockStatus::SUCCESS;
 }
 
@@ -1139,6 +1149,12 @@ Decoder::DecodedBlockStatus Decoder::DecodeInstruction(uint64_t PC) {
       // The fault is at the first byte that couldn't be read. The zeros read in its place can make the decode fail before
       // the instruction's size is recorded, so take the size from the bytes that were read.
       DecodeInst->InstSize = InstructionSize;
+      // Populate ValidateSize/InstCRC from the consumed readable prefix bytes so a
+      // cached fault block on a promoted inline-SMC page still invalidates if those
+      // executable prefix bytes are patched.
+      const uint8_t ValidateSize = static_cast<uint8_t>(std::min<size_t>(InstructionSize, MAX_INST_SIZE));
+      DecodeInst->ValidateSize = ValidateSize;
+      DecodeInst->InstCRC = ValidateSize ? FEXCore::Utils::crc32(Instruction.data(), ValidateSize) : 0;
       return DecodeInst->InstSize ? DecodedBlockStatus::PARTIAL_DECODE_INST : DecodedBlockStatus::NOEXEC_INST;
     }
 
@@ -1146,8 +1162,17 @@ Decoder::DecodedBlockStatus Decoder::DecodeInstruction(uint64_t PC) {
     DecodeInst->InstSize = 0;
 
     if (HitBadRelocation) {
+      DecodeInst->ValidateSize = 0;
+      DecodeInst->InstCRC = 0;
       return DecodedBlockStatus::BAD_RELOCATION;
     }
+
+    // Retain the consumed byte count and CRC for inline SMC validation so a guest SIGILL
+    // handler patching an invalid/unimplemented instruction on an inline-SMC page invalidates
+    // this cached InvalidOp block on resume.
+    const uint8_t ValidateSize = static_cast<uint8_t>(std::min<size_t>(InstructionSize, MAX_INST_SIZE));
+    DecodeInst->ValidateSize = ValidateSize;
+    DecodeInst->InstCRC = ValidateSize ? FEXCore::Utils::crc32(Instruction.data(), ValidateSize) : 0;
 
     return ErrorDuringDecoding;
   } else if (!DecodeInst->TableInfo || (DecodeInst->TableInfo->Type == TYPE_INST && !DecodeInst->TableInfo->OpcodeDispatcher.OpDispatch)) {
@@ -1396,6 +1421,7 @@ void Decoder::AddBranchTarget(uint64_t Target) {
           .NumInstructions = BlockIt->NumInstructions - SplitIdx,
           .DecodedInstructions = BlockIt->DecodedInstructions + SplitIdx,
           .BlockStatus = BlockIt->BlockStatus,
+          .ForceFullSMCDetection = BlockIt->ForceFullSMCDetection,
         };
 
         if (BlockIt->DataMasks.size()) {
@@ -1671,7 +1697,7 @@ void Decoder::DecodeLoop(const uint8_t* _InstStream, uint64_t GuestSizePause) {
 
       // MAX_INST_SIZE assumes worst case
       auto OpAddress = BlockIt->Entry + PCOffset;
-      auto OpMaxAddress = OpAddress + MAX_INST_SIZE;
+      auto OpMaxAddress = OpAddress + MAX_INST_SIZE - 1;
 
       auto OpMinPage = OpAddress & FEXCore::Utils::FEX_PAGE_MASK;
       auto OpMaxPage = OpMaxAddress & FEXCore::Utils::FEX_PAGE_MASK;
@@ -1685,11 +1711,11 @@ void Decoder::DecodeLoop(const uint8_t* _InstStream, uint64_t GuestSizePause) {
 
       // Before any byte of the instruction is read
       if (OpMinPage != CurrentCodePage) {
-        AddCodePage(OpMinPage);
+        ProtectCodePage(OpMinPage);
       }
 
       if (OpMaxPage != CurrentCodePage) {
-        AddCodePage(OpMaxPage);
+        ProtectCodePage(OpMaxPage);
       }
 
       LastFieldReadSize = 0;
@@ -1740,6 +1766,12 @@ void Decoder::DecodeLoop(const uint8_t* _InstStream, uint64_t GuestSizePause) {
           }
           EraseBlock = true;
         } else {
+          RecordCodePage(OpMinPage);
+          if (OpMaxPage != OpMinPage &&
+              (OpAddress + InstructionSize > OpMaxPage ||
+               (HitNonExecutableRange && OpAddress + InstructionSize >= OpMaxPage))) {
+            RecordCodePage(OpMaxPage);
+          }
           LogMan::Msg::EFmt("{} instruction in entry block: {:X}",
                             BlockIt->BlockStatus == DecodedBlockStatus::BREAKPOINT_0       ? "Breakpoint" :
                             BlockIt->BlockStatus == DecodedBlockStatus::BREAKPOINT_1       ? "Breakpoint" :
@@ -1753,6 +1785,11 @@ void Decoder::DecodeLoop(const uint8_t* _InstStream, uint64_t GuestSizePause) {
                             OpAddress);
         }
         break;
+      }
+
+      RecordCodePage(OpMinPage);
+      if (OpMaxPage != OpMinPage && OpAddress + InstructionSize > OpMaxPage) {
+        RecordCodePage(OpMaxPage);
       }
 
       if (GuestSizePause) {
@@ -1833,14 +1870,21 @@ void Decoder::DecodeLoop(const uint8_t* _InstStream, uint64_t GuestSizePause) {
   }
 }
 
-void Decoder::AddCodePage(uint64_t Page) {
+void Decoder::ProtectCodePage(uint64_t Page) {
   CurrentCodePage = Page;
-  if (BlockInfo.CodePages.insert(Page).second && ProtectCodePages && !Thread->LookupCache->HasCodePage(Page)) {
+  if (ProtectCodePages && ProtectedCodePages.insert(Page).second && !Thread->LookupCache->HasCodePage(Page)) {
     // Protect the page before reading it, not after compiling: a write between the two would not fault, and the block would keep
     // the old code. A write after this faults, and its invalidation waits for the compile to finish (CodeInvalidationMutex).
     // If the decode produces no block, the page stays protected without code: the next compile protects it again, and a write
     // takes one extra fault.
     CTX->SyscallHandler->MarkGuestExecutableRange(Thread, Page, FEXCore::Utils::FEX_PAGE_SIZE);
+  }
+}
+
+void Decoder::RecordCodePage(uint64_t Page) {
+  if (Page != LastRecordedCodePage) {
+    BlockInfo.CodePages.insert(Page);
+    LastRecordedCodePage = Page;
   }
 }
 
@@ -1895,7 +1939,10 @@ void Decoder::SetupDecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState*
 
   ProtectCodePages = Protect;
   BlockInfo.CodePages.clear();
-  AddCodePage(PC & FEXCore::Utils::FEX_PAGE_MASK);
+  ProtectedCodePages.clear();
+  CurrentCodePage = ~0ULL;
+  LastRecordedCodePage = ~0ULL;
+  ProtectCodePage(PC & FEXCore::Utils::FEX_PAGE_MASK);
 
   EntryBlock = true;
   FinalInstruction = false;

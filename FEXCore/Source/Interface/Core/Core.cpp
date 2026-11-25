@@ -700,15 +700,18 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
           Thread->OpDispatcher->_GuestOpcode(InstAddress - GuestRIP);
         }
 
-        if (Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL || Block.ForceFullSMCDetection) {
+        const uint8_t ValidateSize = DecodedInfo->ValidateSize;
+        if ((Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL || Block.ForceFullSMCDetection) && ValidateSize != 0) {
           auto ExistingCodePtr = reinterpret_cast<uint8_t*>(Block.Entry + BlockInstructionsLength);
           auto InstAddressReg = Thread->OpDispatcher->_EntrypointOffset(GPRSize, InstAddress - GuestRIP);
 
-          auto Value = FEXCore::Utils::crc32(ExistingCodePtr, DecodedInfo->InstSize);
-          auto CRC = WantsDiskCachePatching ?
-                       Thread->OpDispatcher->_PatchableGuestCRC(IR::OpSize::i64Bit, Value, (int64_t)ExistingCodePtr, DecodedInfo->InstSize) :
+          auto Value = ValidateSize <= FEXCore::Frontend::Decoder::MAX_INST_SIZE ?
+                         DecodedInfo->InstCRC :
+                         FEXCore::Utils::crc32(ExistingCodePtr, ValidateSize);
+          auto CRC = (WantsDiskCachePatching && !Block.ForceFullSMCDetection) ?
+                       Thread->OpDispatcher->_PatchableGuestCRC(IR::OpSize::i64Bit, Value, (int64_t)ExistingCodePtr, ValidateSize) :
                        Thread->OpDispatcher->Constant(Value);
-          auto CodeChanged = Thread->OpDispatcher->_ValidateCode(CRC, InstAddressReg, DecodedInfo->InstSize);
+          auto CodeChanged = Thread->OpDispatcher->_ValidateCode(CRC, InstAddressReg, ValidateSize);
 
           auto InvalidateCodeCond = Thread->OpDispatcher->CondJump(CodeChanged);
 
@@ -1201,24 +1204,30 @@ void ContextImpl::RetireOldCodeBuffers(FEXCore::Core::InternalThreadState* Threa
 #endif
 }
 
-void ContextImpl::InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length) {
+bool ContextImpl::InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length) {
   FEXCORE_PROFILE_SCOPED("InvalidateCodeBuffersCodeRange");
 
+#if defined(ASSERTIONS_ENABLED) && ASSERTIONS_ENABLED
   LOGMAN_THROW_A_FMT(CodeInvalidationMutex.try_lock() == false, "CodeInvalidationMutex needs to be unique_locked here");
+#endif
+  bool Invalidated = false;
   std::scoped_lock lk {CodeBufferListLock};
   auto it = CodeBufferList.begin();
   while (it != CodeBufferList.end()) {
     if (auto Strong = it->lock()) {
-      Strong->LookupCache->InvalidateRange(Start, Length);
+      Invalidated |= Strong->LookupCache->InvalidateRange(Start, Length);
       it++;
     } else {
       it = CodeBufferList.erase(it);
     }
   }
+  return Invalidated;
 }
 
 void ContextImpl::InvalidateThreadCachedCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) {
+#if defined(ASSERTIONS_ENABLED) && ASSERTIONS_ENABLED
   LOGMAN_THROW_A_FMT(CodeInvalidationMutex.try_lock() == false, "CodeInvalidationMutex needs to be unique_locked here");
+#endif
 
   // Ensures now-modified mappings aren't cached as being in their previous non-executable state.
   // Accessing FrontendDecoder is safe as the thread's code invalidation mutex must be locked here.
@@ -1298,13 +1307,17 @@ void ContextImpl::AddThunkTrampolineIRHandler(uintptr_t Entrypoint, uintptr_t Gu
 }
 
 void ContextImpl::AddForceTSOInformation(const IntervalList<uint64_t>& ValidRanges, fextl::set<uint64_t>&& Instructions) {
+#if defined(ASSERTIONS_ENABLED) && ASSERTIONS_ENABLED
   LogMan::Throw::AFmt(CodeInvalidationMutex.try_lock() == false, "CodeInvalidationMutex needs to be unique_locked here");
+#endif
   ForceTSOValidRanges.Insert(ValidRanges);
   ForceTSOInstructions.merge(std::move(Instructions));
 }
 
 void ContextImpl::RemoveForceTSOInformation(uint64_t Address, uint64_t Size) {
+#if defined(ASSERTIONS_ENABLED) && ASSERTIONS_ENABLED
   LogMan::Throw::AFmt(CodeInvalidationMutex.try_lock() == false, "CodeInvalidationMutex needs to be unique_locked here");
+#endif
 
   ForceTSOValidRanges.Remove({Address, Address + Size});
   ForceTSOInstructions.erase(ForceTSOInstructions.lower_bound(Address), ForceTSOInstructions.upper_bound(Address + Size));

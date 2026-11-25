@@ -229,11 +229,12 @@ public:
     // while holding ThreadCreationMutex or CodeInvalidationMutex (and so deferred signals fire only after both unlock).
     auto ThreadCreationlk = FEXCore::GuardSignalDeferringSectionWithFallback(ThreadCreationMutex, CallingThread);
     std::lock_guard CodeInvalidationlk(CTX->GetCodeInvalidationMutex());
-    Fn([this](uint64_t Start, uint64_t Length) {
-      CTX->InvalidateCodeBuffersCodeRange(Start, Length);
+    Fn([this](uint64_t Start, uint64_t Length) -> bool {
+      const bool Invalidated = CTX->InvalidateCodeBuffersCodeRange(Start, Length);
       for (auto& Thread : Threads) {
         CTX->InvalidateThreadCachedCodeRange(Thread->Thread, Start, Length);
       }
+      return Invalidated;
     });
   }
 

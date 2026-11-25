@@ -152,7 +152,7 @@ public:
   virtual void FlushAndCloseCodeMap() = 0;
 
   FEX_DEFAULT_VISIBILITY virtual void ClearCodeCache(FEXCore::Core::InternalThreadState* Thread, bool NewCodeBuffer = true) = 0;
-  FEX_DEFAULT_VISIBILITY virtual void InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length) = 0;
+  FEX_DEFAULT_VISIBILITY virtual bool InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length) = 0;
   FEX_DEFAULT_VISIBILITY virtual void
   InvalidateThreadCachedCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) = 0;
   FEX_DEFAULT_VISIBILITY virtual FEXCore::Utils::WritePriorityMutex::Mutex& GetCodeInvalidationMutex() = 0;
