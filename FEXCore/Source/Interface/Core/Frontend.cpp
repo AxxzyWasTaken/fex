@@ -1146,10 +1146,12 @@ Decoder::DecodedBlockStatus Decoder::DecodeInstruction(uint64_t PC) {
     // A decode error can be caused by substituting zero for an inaccessible
     // instruction byte, so the instruction fetch fault takes priority.
     if (HitNonExecutableRange) {
+      // The fault is at the first byte that couldn't be read. The zeros read in its place can make the decode fail before
+      // the instruction's size is recorded, so take the size from the bytes that were read.
+      DecodeInst->InstSize = InstructionSize;
       // Populate ValidateSize/InstCRC from the consumed readable prefix bytes so a
       // cached fault block on a promoted inline-SMC page still invalidates if those
-      // executable prefix bytes are patched (whether PARTIAL_DECODE_INST or an
-      // early-return NOEXEC_INST after consuming prefix/escape bytes).
+      // executable prefix bytes are patched.
       const uint8_t ValidateSize = static_cast<uint8_t>(std::min<size_t>(InstructionSize, MAX_INST_SIZE));
       DecodeInst->ValidateSize = ValidateSize;
       DecodeInst->InstCRC = ValidateSize ? FEXCore::Utils::crc32(Instruction.data(), ValidateSize) : 0;
