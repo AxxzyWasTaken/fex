@@ -122,8 +122,8 @@ static void SetXStateInfo(T* xstate, bool is_avx_enabled) {
   }
 }
 
-void SignalDelegator::RestoreFrame_x64(FEXCore::Core::InternalThreadState* Thread, ArchHelpers::Context::ContextBackup* Context,
-                                       FEXCore::Core::CpuStateFrame* Frame) {
+uint64_t SignalDelegator::RestoreFrame_x64(FEXCore::Core::InternalThreadState* Thread, ArchHelpers::Context::ContextBackup* Context,
+                                           FEXCore::Core::CpuStateFrame* Frame) {
   auto* guest_uctx = reinterpret_cast<FEXCore::x86_64::ucontext_t*>(Context->UContextLocation);
   [[maybe_unused]] auto* guest_siginfo = reinterpret_cast<siginfo_t*>(Context->SigInfoLocation);
 
@@ -189,10 +189,12 @@ void SignalDelegator::RestoreFrame_x64(FEXCore::Core::InternalThreadState* Threa
     const auto modulo_i = (i + CurrentOffset) % 8;
     memcpy(&Frame->State.mm[modulo_i], &fpstate->_st[i], sizeof(Frame->State.mm[0]));
   }
+
+  return guest_uctx->uc_sigmask.val[0];
 }
 
-void SignalDelegator::RestoreFrame_ia32(FEXCore::Core::InternalThreadState* Thread, ArchHelpers::Context::ContextBackup* Context,
-                                        FEXCore::Core::CpuStateFrame* Frame) {
+uint64_t SignalDelegator::RestoreFrame_ia32(FEXCore::Core::InternalThreadState* Thread, ArchHelpers::Context::ContextBackup* Context,
+                                            FEXCore::Core::CpuStateFrame* Frame) {
   SigFrame_i32* guest_uctx = reinterpret_cast<SigFrame_i32*>(Context->UContextLocation);
   // XXX: Full context setting
   CTX->SetFlagsFromCompactedEFLAGS(Thread, guest_uctx->sc.flags);
@@ -254,10 +256,12 @@ void SignalDelegator::RestoreFrame_ia32(FEXCore::Core::InternalThreadState* Thre
     const auto modulo_i = (i + CurrentOffset) % 8;
     memcpy(&Frame->State.mm[modulo_i], &fpstate->_st[i], 10);
   }
+
+  return (static_cast<uint64_t>(guest_uctx->extramask[0]) << 32) | guest_uctx->sc.oldmask;
 }
 
-void SignalDelegator::RestoreRTFrame_ia32(FEXCore::Core::InternalThreadState* Thread, ArchHelpers::Context::ContextBackup* Context,
-                                          FEXCore::Core::CpuStateFrame* Frame) {
+uint64_t SignalDelegator::RestoreRTFrame_ia32(FEXCore::Core::InternalThreadState* Thread, ArchHelpers::Context::ContextBackup* Context,
+                                              FEXCore::Core::CpuStateFrame* Frame) {
   RTSigFrame_i32* guest_uctx = reinterpret_cast<RTSigFrame_i32*>(Context->UContextLocation);
   // XXX: Full context setting
   CTX->SetFlagsFromCompactedEFLAGS(Thread, guest_uctx->uc.uc_mcontext.gregs[FEXCore::x86::FEX_REG_EFL]);
@@ -319,6 +323,8 @@ void SignalDelegator::RestoreRTFrame_ia32(FEXCore::Core::InternalThreadState* Th
     const auto modulo_i = (i + CurrentOffset) % 8;
     memcpy(&Frame->State.mm[modulo_i], &fpstate->_st[i], 10);
   }
+
+  return guest_uctx->uc.uc_sigmask.val[0];
 }
 
 uint64_t SignalDelegator::SetupFrame_x64(FEXCore::Core::InternalThreadState* Thread, ArchHelpers::Context::ContextBackup* ContextBackup,
@@ -372,6 +378,7 @@ uint64_t SignalDelegator::SetupFrame_x64(FEXCore::Core::InternalThreadState* Thr
 
   // We have extended float information
   guest_uctx->uc_flags = FEXCore::x86_64::UC_FP_XSTATE | FEXCore::x86_64::UC_SIGCONTEXT_SS | FEXCore::x86_64::UC_STRICT_RESTORE_SS;
+  guest_uctx->uc_link = nullptr;
 
   // Pointer to where the fpreg memory is
   guest_uctx->uc_mcontext.fpregs = reinterpret_cast<FEXCore::x86_64::_libc_fpstate*>(FPStateLocation);
@@ -407,7 +414,7 @@ uint64_t SignalDelegator::SetupFrame_x64(FEXCore::Core::InternalThreadState* Thr
     guest_uctx->uc_mcontext.gregs[FEXCore::x86_64::FEX_REG_TRAPNO] = ConvertSignalToTrapNo(Signal, HostSigInfo);
     guest_uctx->uc_mcontext.gregs[FEXCore::x86_64::FEX_REG_ERR] = ConvertSignalToError(ucontext, Signal, HostSigInfo);
   }
-  guest_uctx->uc_mcontext.gregs[FEXCore::x86_64::FEX_REG_OLDMASK] = 0;
+  guest_uctx->uc_mcontext.gregs[FEXCore::x86_64::FEX_REG_OLDMASK] = ContextBackup->GuestSigMask;
   guest_uctx->uc_mcontext.gregs[FEXCore::x86_64::FEX_REG_CR2] = 0;
 
 #define COPY_REG(x) guest_uctx->uc_mcontext.gregs[FEXCore::x86_64::FEX_REG_##x] = Frame->State.gregs[FEXCore::X86State::REG_##x];
@@ -461,6 +468,10 @@ uint64_t SignalDelegator::SetupFrame_x64(FEXCore::Core::InternalThreadState* Thr
   guest_uctx->uc_stack.ss_flags = GuestStack->ss_flags;
   guest_uctx->uc_stack.ss_sp = GuestStack->ss_sp;
   guest_uctx->uc_stack.ss_size = GuestStack->ss_size;
+
+  // Populate the saved signal mask so handlers can inspect or modify uc_sigmask.
+  memset(&guest_uctx->uc_sigmask, 0, sizeof(guest_uctx->uc_sigmask));
+  guest_uctx->uc_sigmask.val[0] = ContextBackup->GuestSigMask;
 
   // Apparently RAX is always set to zero in case of badly misbehaving C applications and variadics.
   Frame->State.gregs[FEXCore::X86State::REG_RAX] = 0;
@@ -540,6 +551,8 @@ uint64_t SignalDelegator::SetupFrame_ia32(FEXCore::Core::InternalThreadState* Th
   guest_uctx->sc.ip = ContextBackup->OriginalRIP;
   guest_uctx->sc.flags = eflags;
   guest_uctx->sc.sp_at_signal = 0;
+  guest_uctx->sc.oldmask = static_cast<uint32_t>(ContextBackup->GuestSigMask);
+  guest_uctx->extramask[0] = static_cast<uint32_t>(ContextBackup->GuestSigMask >> 32);
 
 #define COPY_REG(x, y) guest_uctx->sc.x = Frame->State.gregs[FEXCore::X86State::REG_##y];
   COPY_REG(di, RDI);
@@ -676,6 +689,7 @@ uint64_t SignalDelegator::SetupRTFrame_ia32(FEXCore::Core::InternalThreadState* 
   guest_uctx->uc.uc_mcontext.gregs[FEXCore::x86::FEX_REG_EIP] = ContextBackup->OriginalRIP;
   guest_uctx->uc.uc_mcontext.gregs[FEXCore::x86::FEX_REG_EFL] = eflags;
   guest_uctx->uc.uc_mcontext.gregs[FEXCore::x86::FEX_REG_UESP] = Frame->State.gregs[FEXCore::X86State::REG_RSP];
+  guest_uctx->uc.uc_mcontext.oldmask = static_cast<uint32_t>(ContextBackup->GuestSigMask);
   guest_uctx->uc.uc_mcontext.cr2 = 0;
 
 #define COPY_REG(x) guest_uctx->uc.uc_mcontext.gregs[FEXCore::x86::FEX_REG_##x] = Frame->State.gregs[FEXCore::X86State::REG_##x];
@@ -722,6 +736,10 @@ uint64_t SignalDelegator::SetupRTFrame_ia32(FEXCore::Core::InternalThreadState* 
   guest_uctx->uc.uc_stack.ss_flags = GuestStack->ss_flags;
   guest_uctx->uc.uc_stack.ss_sp = static_cast<uint32_t>(reinterpret_cast<uint64_t>(GuestStack->ss_sp));
   guest_uctx->uc.uc_stack.ss_size = GuestStack->ss_size;
+
+  // Populate the saved signal mask so handlers can inspect or modify uc_sigmask.
+  memset(&guest_uctx->uc.uc_sigmask, 0, sizeof(guest_uctx->uc.uc_sigmask));
+  guest_uctx->uc.uc_sigmask.val[0] = ContextBackup->GuestSigMask;
 
   // Setup siginfo
   // These three elements are in every siginfo

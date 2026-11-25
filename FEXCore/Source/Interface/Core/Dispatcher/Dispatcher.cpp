@@ -514,6 +514,14 @@ void Dispatcher::EmitDispatcher() {
     // First thing we need to move the thread state pointer back in to our register
     mov(STATE, ARMEmitter::XReg::x0);
 
+    // Save the enclosing thunk's InSyscallInfo on the 16-byte aligned host stack and clear it before
+    // mutating guest state or filling static registers. Because CallbackPtr executes in the dispatcher,
+    // clearing InSyscallInfo enables BetweenChecks deferral for async signals until the callback enters
+    // JIT code, while CallbackReturn restores the saved value before returning to the host thunk.
+    ldr(ARMEmitter::XReg::x2, STATE_PTR(CpuStateFrame, InSyscallInfo));
+    stp<ARMEmitter::IndexType::PRE>(ARMEmitter::XReg::x2, ARMEmitter::XReg::zr, ARMEmitter::Reg::rsp, -16);
+    str(ARMEmitter::XReg::zr, STATE_PTR(CpuStateFrame, InSyscallInfo));
+
     // Make sure to adjust the refcounter so we don't clear the cache now
     ldr(ARMEmitter::WReg::w2, STATE_PTR(CpuStateFrame, SignalHandlerRefCounter));
     add(ARMEmitter::Size::i32Bit, ARMEmitter::Reg::r2, ARMEmitter::Reg::r2, 1);

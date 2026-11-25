@@ -37,6 +37,19 @@ DEF_OP(CallbackReturn) {
   add(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r2, ARMEmitter::Reg::r2, 8);
   str(ARMEmitter::XReg::x2, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.gregs[X86State::REG_RSP]));
 
+  // Restore the enclosing thunk's InSyscallInfo saved by CallbackPtr before returning to the host thunk.
+  ldp<ARMEmitter::IndexType::POST>(ARMEmitter::XReg::x2, ARMEmitter::XReg::x3, ARMEmitter::Reg::rsp, 16);
+  str(ARMEmitter::XReg::x2, STATE, offsetof(FEXCore::Core::CpuStateFrame, InSyscallInfo));
+  if (CTX->Config.NeedsPendingInterruptFaultCheck) {
+    // Flush any async signal deferred during the callback or CallbackReturn before returning into
+    // a potentially blocking host thunk. Only check when InSyscallInfo is non-zero so HandleDispatcherGuestSignal
+    // keeps the frame copy instead of spilling over the already-adjusted guest RSP.
+    ARMEmitter::ForwardLabel SkipPendingCheck;
+    cbz_OrRestart(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r2, &SkipPendingCheck);
+    EmitPendingInterruptFaultCheck();
+    BindOrRestart(&SkipPendingCheck);
+  }
+
   PopCalleeSavedRegisters();
 
   // Return to the thunk
@@ -325,6 +338,15 @@ DEF_OP(Thunk) {
 
   PopDynamicRegs();
 
+  if (CTX->Config.NeedsPendingInterruptFaultCheck) {
+    // Defer async signals across FillStaticRegs and clearing IN_THUNK_CALL so a signal cannot arrive
+    // after static registers are partially or fully filled while IN_THUNK_CALL is still set (which
+    // suppresses FillSRA on sigreturn).
+    ldr(TMP1, STATE, offsetof(FEXCore::Core::CPUState, DeferredSignalRefCount));
+    add(ARMEmitter::Size::i64Bit, TMP1, TMP1, 1);
+    str(TMP1, STATE, offsetof(FEXCore::Core::CPUState, DeferredSignalRefCount));
+  }
+
   // load from ctx after ra64 refill
   FillStaticRegs({
     .NZCV = false,
@@ -332,6 +354,10 @@ DEF_OP(Thunk) {
 
   if (CTX->Config.NeedsPendingInterruptFaultCheck) {
     str(ARMEmitter::XReg::zr, STATE, offsetof(FEXCore::Core::CpuStateFrame, InSyscallInfo));
+    ldr(TMP1, STATE, offsetof(FEXCore::Core::CPUState, DeferredSignalRefCount));
+    sub(ARMEmitter::Size::i64Bit, TMP1, TMP1, 1);
+    str(TMP1, STATE, offsetof(FEXCore::Core::CPUState, DeferredSignalRefCount));
+    EmitPendingInterruptFaultCheck();
   }
 }
 

@@ -543,9 +543,12 @@ uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEX
   uintptr_t HostCode {};
   auto GuestRip = Record->GuestRIP;
 
+  // Keep Frame->State.rip current so a deferred async signal fired at ExitFunctionLinkerAddress's
+  // EmitPendingInterruptFaultCheck sees the exact target RIP rather than a stale earlier RIP.
+  Frame->State.rip = GuestRip;
+
   if (TFSet) {
     // If TF is set, the cache must be skipped as different code needs to be generated.
-    Frame->State.rip = GuestRip;
     return Frame->Pointers.DispatcherLoopTop;
   } else {
     {

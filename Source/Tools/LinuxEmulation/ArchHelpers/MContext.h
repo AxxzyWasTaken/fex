@@ -40,7 +40,8 @@ struct X86ContextBackup {
   uint64_t GPRs[23];
   FEXCore::x86_64::_libc_fpstate FPRState;
   uint64_t sa_mask;
-  uint16_t InSyscallInfo;
+  uint64_t GuestSigMask;
+  uint32_t InSyscallInfo;
   bool FaultToTopAndGeneratedException;
 
   // Guest state
@@ -68,7 +69,8 @@ struct ArmContextBackup {
   uint32_t FPCR;
   __uint128_t FPRs[32];
   uint64_t sa_mask;
-  uint16_t InSyscallInfo;
+  uint64_t GuestSigMask;
+  uint32_t InSyscallInfo;
   bool FaultToTopAndGeneratedException;
 
   // Guest state
