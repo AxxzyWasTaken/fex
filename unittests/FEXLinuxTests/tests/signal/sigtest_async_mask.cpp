@@ -9,6 +9,7 @@
 #include <sys/resource.h>
 #include <sys/wait.h>
 #include <thread>
+#include <ucontext.h>
 #include <unistd.h>
 
 namespace {
@@ -417,6 +418,215 @@ static int run_queued_asymmetric_child() {
   return 0;
 }
 
+// --- Test 4: ucontext uc_sigmask reflects pre-signal mask and applies handler edits on sigreturn ---
+
+static volatile sig_atomic_t g_uctx_mask_calls = 0;
+static volatile sig_atomic_t g_uctx_mask_observed_ok = 0;
+
+static void uctx_sigmask_handler(int sig, siginfo_t*, void* ctx) {
+  g_uctx_mask_calls = g_uctx_mask_calls + 1;
+  if (g_uctx_mask_calls > 1) {
+    return;
+  }
+  auto* uctx = static_cast<ucontext_t*>(ctx);
+  if (sigismember(&uctx->uc_sigmask, SIGUSR2) == 1 && sigismember(&uctx->uc_sigmask, SIGUSR1) == 0 && sigismember(&uctx->uc_sigmask, SIGALRM) == 0) {
+    g_uctx_mask_observed_ok = 1;
+  }
+  // Re-raise SIGUSR1 while blocked, then block SIGUSR1 and unblock SIGUSR2 in uc_sigmask.
+  raise(sig);
+  sigaddset(&uctx->uc_sigmask, SIGUSR1);
+  sigdelset(&uctx->uc_sigmask, SIGUSR2);
+}
+
+static int run_ucontext_sigmask_child() {
+  alarm(5);
+
+  struct sigaction act {};
+  act.sa_sigaction = uctx_sigmask_handler;
+  sigemptyset(&act.sa_mask);
+  act.sa_flags = SA_SIGINFO;
+  if (sigaction(SIGUSR1, &act, nullptr) != 0) {
+    return 1;
+  }
+
+  sigset_t init_mask {};
+  sigemptyset(&init_mask);
+  sigaddset(&init_mask, SIGUSR2);
+  if (sigprocmask(SIG_SETMASK, &init_mask, nullptr) != 0) {
+    return 2;
+  }
+
+  g_uctx_mask_calls = 0;
+  g_uctx_mask_observed_ok = 0;
+  if (raise(SIGUSR1) != 0) {
+    return 3;
+  }
+
+  if (g_uctx_mask_calls != 1 || g_uctx_mask_observed_ok != 1) {
+    return 4;
+  }
+
+  sigset_t after_mask {};
+  if (sigprocmask(0, nullptr, &after_mask) != 0) {
+    return 5;
+  }
+  if (sigismember(&after_mask, SIGUSR1) != 1 || sigismember(&after_mask, SIGUSR2) != 0) {
+    return 6;
+  }
+
+  // Pending SIGUSR1 from inside the handler must still be pending until unblocked.
+  sigset_t pending {};
+  if (sigpending(&pending) != 0 || sigismember(&pending, SIGUSR1) != 1) {
+    return 7;
+  }
+
+  sigset_t empty {};
+  sigemptyset(&empty);
+  if (sigprocmask(SIG_SETMASK, &empty, nullptr) != 0) {
+    return 8;
+  }
+  if (g_uctx_mask_calls != 2) {
+    return 9;
+  }
+
+  return 0;
+}
+
+// --- Test 5: sigsuspend preserves handler uc_sigmask edits on sigreturn ---
+
+static volatile sig_atomic_t g_sigsuspend_uctx_calls = 0;
+static volatile sig_atomic_t g_sigsuspend_uctx_observed_ok = 0;
+static volatile sig_atomic_t g_sigsuspend_usr2_calls = 0;
+static volatile sig_atomic_t g_sigsuspend_pipe_calls = 0;
+static volatile sig_atomic_t g_sigsuspend_expected_sig = 0;
+
+static void sigsuspend_uctx_handler(int sig, siginfo_t*, void* ctx) {
+  g_sigsuspend_uctx_calls = g_sigsuspend_uctx_calls + 1;
+  if (g_sigsuspend_uctx_calls > 1) {
+    return;
+  }
+  auto* uctx = static_cast<ucontext_t*>(ctx);
+  if (sig == g_sigsuspend_expected_sig && sigismember(&uctx->uc_sigmask, sig) == 1 && sigismember(&uctx->uc_sigmask, SIGUSR2) == 1 &&
+      sigismember(&uctx->uc_sigmask, SIGPIPE) == 0) {
+    g_sigsuspend_uctx_observed_ok = 1;
+  }
+  // Modify uc_sigmask: unblock SIGUSR2 and block SIGPIPE while keeping sig blocked.
+  sigdelset(&uctx->uc_sigmask, SIGUSR2);
+  sigaddset(&uctx->uc_sigmask, SIGPIPE);
+}
+
+static void sigsuspend_usr2_count_handler(int) {
+  g_sigsuspend_usr2_calls = g_sigsuspend_usr2_calls + 1;
+}
+
+static void sigsuspend_pipe_count_handler(int) {
+  g_sigsuspend_pipe_calls = g_sigsuspend_pipe_calls + 1;
+}
+
+static int run_sigsuspend_ucontext_sigmask_case(int tested_signal) {
+  g_sigsuspend_uctx_calls = 0;
+  g_sigsuspend_uctx_observed_ok = 0;
+  g_sigsuspend_usr2_calls = 0;
+  g_sigsuspend_pipe_calls = 0;
+  g_sigsuspend_expected_sig = tested_signal;
+
+  struct sigaction act {};
+  act.sa_sigaction = sigsuspend_uctx_handler;
+  sigemptyset(&act.sa_mask);
+  act.sa_flags = SA_SIGINFO;
+  if (sigaction(tested_signal, &act, nullptr) != 0) {
+    return 1;
+  }
+
+  struct sigaction usr2_act {};
+  usr2_act.sa_handler = sigsuspend_usr2_count_handler;
+  sigemptyset(&usr2_act.sa_mask);
+  if (sigaction(SIGUSR2, &usr2_act, nullptr) != 0) {
+    return 2;
+  }
+
+  struct sigaction pipe_act {};
+  pipe_act.sa_handler = sigsuspend_pipe_count_handler;
+  sigemptyset(&pipe_act.sa_mask);
+  if (sigaction(SIGPIPE, &pipe_act, nullptr) != 0) {
+    return 3;
+  }
+
+  sigset_t pre_mask {};
+  sigemptyset(&pre_mask);
+  sigaddset(&pre_mask, tested_signal);
+  sigaddset(&pre_mask, SIGUSR2);
+  if (sigprocmask(SIG_SETMASK, &pre_mask, nullptr) != 0) {
+    return 4;
+  }
+
+  if (raise(tested_signal) != 0) {
+    return 5;
+  }
+  if (g_sigsuspend_uctx_calls != 0) {
+    return 6;
+  }
+
+  sigset_t suspend_mask {};
+  sigemptyset(&suspend_mask);
+  sigaddset(&suspend_mask, SIGPIPE);
+
+  errno = 0;
+  if (sigsuspend(&suspend_mask) != -1 || errno != EINTR) {
+    return 7;
+  }
+
+  if (g_sigsuspend_uctx_calls != 1 || g_sigsuspend_uctx_observed_ok != 1) {
+    return 8;
+  }
+
+  sigset_t after_mask {};
+  if (sigprocmask(0, nullptr, &after_mask) != 0) {
+    return 9;
+  }
+  if (sigismember(&after_mask, tested_signal) != 1 || sigismember(&after_mask, SIGUSR2) != 0 || sigismember(&after_mask, SIGPIPE) != 1) {
+    return 10;
+  }
+
+  // Verify the host mask also reflects the handler's uc_sigmask edits:
+  // SIGUSR2 must deliver immediately; SIGPIPE must remain pending until unblocked.
+  if (raise(SIGUSR2) != 0 || g_sigsuspend_usr2_calls != 1) {
+    return 11;
+  }
+  if (raise(SIGPIPE) != 0 || g_sigsuspend_pipe_calls != 0) {
+    return 12;
+  }
+  sigset_t pending {};
+  if (sigpending(&pending) != 0 || sigismember(&pending, SIGPIPE) != 1) {
+    return 13;
+  }
+
+  sigset_t empty {};
+  sigemptyset(&empty);
+  if (sigprocmask(SIG_SETMASK, &empty, nullptr) != 0) {
+    return 14;
+  }
+  if (g_sigsuspend_pipe_calls != 1) {
+    return 15;
+  }
+
+  return 0;
+}
+
+static int run_sigsuspend_ucontext_sigmask_child() {
+  alarm(5);
+
+  const int usr1_rc = run_sigsuspend_ucontext_sigmask_case(SIGUSR1);
+  if (usr1_rc != 0) {
+    return usr1_rc;
+  }
+  const int segv_rc = run_sigsuspend_ucontext_sigmask_case(SIGSEGV);
+  if (segv_rc != 0) {
+    return 20 + segv_rc;
+  }
+  return 0;
+}
+
 } // namespace
 
 TEST_CASE("Signals: sigsuspend loop restores pre-suspend mask and wakes on deferred signals") {
@@ -486,6 +696,32 @@ TEST_CASE("Signals: queued signals honor asymmetric sa_mask without starving") {
   REQUIRE(pid >= 0);
   if (pid == 0) {
     _exit(run_queued_asymmetric_child());
+  }
+
+  int status = 0;
+  REQUIRE(waitpid(pid, &status, 0) == pid);
+  REQUIRE(WIFEXITED(status));
+  CHECK(WEXITSTATUS(status) == 0);
+}
+
+TEST_CASE("Signals: ucontext uc_sigmask exposes pre-signal mask and applies edits on sigreturn") {
+  const pid_t pid = fork();
+  REQUIRE(pid >= 0);
+  if (pid == 0) {
+    _exit(run_ucontext_sigmask_child());
+  }
+
+  int status = 0;
+  REQUIRE(waitpid(pid, &status, 0) == pid);
+  REQUIRE(WIFEXITED(status));
+  CHECK(WEXITSTATUS(status) == 0);
+}
+
+TEST_CASE("Signals: sigsuspend preserves handler uc_sigmask edits on sigreturn") {
+  const pid_t pid = fork();
+  REQUIRE(pid >= 0);
+  if (pid == 0) {
+    _exit(run_sigsuspend_ucontext_sigmask_child());
   }
 
   int status = 0;

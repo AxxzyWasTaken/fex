@@ -292,13 +292,6 @@ void SignalDelegator::RestoreThreadState(FEXCore::Core::InternalThreadState* Thr
   // Restore host state
   ArchHelpers::Context::RestoreContext(ucontext, Context);
 
-  if (Type != RestoreType::TYPE_PAUSE) {
-    auto ThreadObject = FEX::HLE::ThreadManager::GetStateObjectFromFEXCoreThread(Thread);
-    ThreadObject->SignalInfo.CurrentSignalMask.Val = Context->GuestSigMask;
-    const uint64_t RestoredHostMask = MaskToHostSigMask(Context->GuestSigMask | GetDeferredSignalsMask(ThreadObject));
-    memcpy(&ArchHelpers::Context::GetUContext(ucontext)->uc_sigmask, &RestoredHostMask, sizeof(uint64_t));
-  }
-
   // Reset the guest state
   memcpy(&Thread->CurrentFrame->State, &Context->GuestState, sizeof(FEXCore::Core::CPUState));
 
@@ -308,17 +301,19 @@ void SignalDelegator::RestoreThreadState(FEXCore::Core::InternalThreadState* Thr
   // over live stack.
   Thread->CurrentFrame->InSyscallInfo = Context->InSyscallInfo;
 
+  uint64_t RestoredGuestMask = Context->GuestSigMask;
   if (Context->UContextLocation) {
     auto Frame = Thread->CurrentFrame;
 
-    // Like the kernel, take the whole guest state from the signal frame, so changes the handler made to it take effect.
+    // Like the kernel, take the whole guest state (including uc_sigmask) from the signal frame,
+    // so changes the handler made to it take effect.
     if (Is64BitMode) {
-      RestoreFrame_x64(Thread, Context, Frame);
+      RestoredGuestMask = RestoreFrame_x64(Thread, Context, Frame);
     } else {
       if (Type == RestoreType::TYPE_NONREALTIME) {
-        RestoreFrame_ia32(Thread, Context, Frame);
+        RestoredGuestMask = RestoreFrame_ia32(Thread, Context, Frame);
       } else {
-        RestoreRTFrame_ia32(Thread, Context, Frame);
+        RestoredGuestMask = RestoreRTFrame_ia32(Thread, Context, Frame);
       }
     }
 
@@ -337,6 +332,15 @@ void SignalDelegator::RestoreThreadState(FEXCore::Core::InternalThreadState* Thr
       const uint32_t ChangedEFLAGS = Context->OriginalEFLAGS ^ CTX->ReconstructCompactedEFLAGS(Thread, false, nullptr, 0);
       FillSRA(Thread, ucontext, Context->InSyscallInfo & 0xFFFF, ChangedEFLAGS);
     }
+  }
+
+  if (Type != RestoreType::TYPE_PAUSE) {
+    constexpr uint64_t IgnoredSignalsMask = ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
+    RestoredGuestMask &= IgnoredSignalsMask;
+    auto ThreadObject = FEX::HLE::ThreadManager::GetStateObjectFromFEXCoreThread(Thread);
+    ThreadObject->SignalInfo.CurrentSignalMask.Val = RestoredGuestMask;
+    const uint64_t RestoredHostMask = MaskToHostSigMask(RestoredGuestMask | GetDeferredSignalsMask(ThreadObject));
+    memcpy(&ArchHelpers::Context::GetUContext(ucontext)->uc_sigmask, &RestoredHostMask, sizeof(uint64_t));
   }
 }
 
@@ -1550,11 +1554,17 @@ uint64_t SignalDelegator::GuestSigSuspend(FEX::HLE::ThreadStateObject* Thread, u
     Result = SyscallRet == -1 ? static_cast<uint64_t>(-errno) : static_cast<uint64_t>(SyscallRet);
   }
 
-  // Restore pre-suspend logical and host signal masks cleanly (and sync InterruptFaultPage).
-  ::syscall(SYS_rt_sigprocmask, SIG_SETMASK, &BlockAsyncMask, nullptr, 8);
-  Thread->SignalInfo.InSigSuspend = false;
-  Thread->SignalInfo.CurrentSignalMask.Val = SavedPreSuspendMask;
-  const uint64_t RestoredHostMask = MaskToHostSigMask(SavedPreSuspendMask | GetDeferredSignalsMask(Thread));
+  // Restore pre-suspend logical mask only if no guest signal handler interrupted sigsuspend
+  // (which clears InSigSuspend and lets rt_sigreturn install the guest frame's uc_sigmask,
+  // including any edits made by the handler). Sync the host mask and InterruptFaultPage from
+  // the resulting CurrentSignalMask.
+  ::syscall(SYS_rt_sigprocmask, SIG_SETMASK, &AllSignals, nullptr, 8);
+  std::atomic_signal_fence(std::memory_order_seq_cst);
+  if (Thread->SignalInfo.InSigSuspend) {
+    Thread->SignalInfo.InSigSuspend = false;
+    Thread->SignalInfo.CurrentSignalMask.Val = SavedPreSuspendMask;
+  }
+  const uint64_t RestoredHostMask = MaskToHostSigMask(Thread->SignalInfo.CurrentSignalMask.Val | GetDeferredSignalsMask(Thread));
   if (Thread->Thread) {
     mprotect(reinterpret_cast<void*>(&Thread->Thread->InterruptFaultPage), sizeof(Thread->Thread->InterruptFaultPage),
              HasDeliverableDeferredSignal(Thread) ? PROT_NONE : (PROT_READ | PROT_WRITE));
