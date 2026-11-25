@@ -58,6 +58,8 @@ target_include_directories(vulkan_procaddr.${BITNESS} PRIVATE "${CMAKE_CURRENT_S
 
 target_link_libraries(timer-sigev-thread.${BITNESS} PRIVATE rt pthread)
 
+target_link_libraries(sigtest_async_mask.${BITNESS} PRIVATE pthread)
+
 target_link_libraries(smc-unexec-stack.${BITNESS} PRIVATE -Wl,-z,noexecstack)
 
 target_link_options(smc-exec-stack.${BITNESS} PRIVATE -Wl,-z,execstack)

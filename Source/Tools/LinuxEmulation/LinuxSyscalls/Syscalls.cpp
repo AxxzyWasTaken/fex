@@ -742,7 +742,9 @@ uint64_t CloneHandler(FEXCore::Core::CpuStateFrame* Frame, FEX::HLE::clone3_args
 };
 
 uint64_t SyscallHandler::HandleBRK(FEXCore::Core::CpuStateFrame* Frame, void* Addr) {
-  std::lock_guard<std::mutex> lk(MMapMutex);
+  // Defer signals before taking MMapMutex: GuestMunmap/GuestMmap below nest deferred signal sections,
+  // and without an outer defer guard any async signal deferred there would fire while MMapMutex is held.
+  auto lk = FEXCore::GuardSignalDeferringSectionWithFallback(MMapMutex, Frame->Thread);
 
   uint64_t Result;
 

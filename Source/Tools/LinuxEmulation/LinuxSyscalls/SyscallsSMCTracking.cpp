@@ -89,22 +89,10 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
 
   {
     // Can't use the deferred signal lock in the SIGSEGV handler.
+    // MaskSignalsAndLockMutex's ScopedSignalMasker also disables allocator deferred signals
+    // while signals are masked, so any jemalloc -> OSAllocator_64Bit::{Mmap,Munmap} falls back
+    // to signal masking instead of faulting on a PROT_NONE InterruptFaultPage.
     auto lk = FEXCore::MaskSignalsAndLockMutex<std::shared_lock>(_SyscallHandler->VMATracking.Mutex);
-
-    // Signals are already masked above; clear the allocator's TLSThread while in SIGSEGV so any
-    // jemalloc -> OSAllocator_64Bit::{Mmap,Munmap} falls back to ScopedSignalMasker instead of
-    // DeferredSignalRefCountGuard (whose store to a PROT_NONE InterruptFaultPage would kill the
-    // process with SIGSEGV masked).
-    struct ScopedDisableAllocatorDeferredSignals {
-      FEXCore::Core::InternalThreadState* SavedThread;
-      explicit ScopedDisableAllocatorDeferredSignals(FEXCore::Core::InternalThreadState* T)
-        : SavedThread(T) {
-        FEXCore::Allocator::UninstallTLSData(SavedThread);
-      }
-      ~ScopedDisableAllocatorDeferredSignals() {
-        FEXCore::Allocator::RegisterTLSData(SavedThread);
-      }
-    } DisableAllocatorDeferredSignals(Thread);
 
     auto& VMATracking = _SyscallHandler->VMATracking;
 
@@ -146,8 +134,8 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
       // all without code being compiled in between.
       // Otherwise a thread could translate the page again from a mirror that is already flushed, while the writable mirrors are
       // still protected, and keep that translation once they are unprotected: the writes that follow wouldn't fault.
-      // Pass nullptr for CallingThread: we are inside SIGSEGV with signals masked by lk above, so we must not use
-      // DeferredSignalRefCountGuard (whose store to a PROT_NONE InterruptFaultPage would kill the process with SIGSEGV masked).
+      // Pass nullptr for CallingThread: we are inside the SIGSEGV handler with signals masked by lk above, so we must not
+      // use DeferredSignalRefCountGuard (whose store to a PROT_NONE InterruptFaultPage would kill the process with SIGSEGV masked).
       _SyscallHandler->TM.InvalidateGuestCodeRanges(nullptr, [&](auto&& Invalidate) {
         bool Invalidated = false;
         for (auto VMA = Entry->second.Resource->FirstVMA; VMA; VMA = VMA->ResourceNextVMA) {
@@ -187,7 +175,7 @@ bool SyscallHandler::HandleSegfault(FEXCore::Core::InternalThreadState* Thread, 
         }
       });
     } else {
-      // Pass nullptr for CallingThread for the same reason as above (inside SIGSEGV with signals masked).
+      // Pass nullptr for CallingThread for the same reason as above (inside SIGSEGV handler with signals masked).
       _SyscallHandler->TM.InvalidateGuestCodeRanges(nullptr, [&](auto&& Invalidate) {
         const bool Invalidated = Invalidate(FaultBase, FEXCore::Utils::FEX_PAGE_SIZE);
 
