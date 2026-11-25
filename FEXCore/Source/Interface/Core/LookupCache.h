@@ -178,6 +178,15 @@ public:
     uintptr_t GuestCode;
   };
 
+  static constexpr uint32_t L1_HASH_SHIFT = 4;
+
+  // Mix bits [k+3:4] into [k-1:0] so 16-byte-aligned x86-64 function entrypoints
+  // utilize all L1 slots instead of only every 16th slot, while remaining collision-free
+  // within any naturally aligned 2^k-byte window and mask-independent for DynamicL1Cache.
+  static constexpr uint64_t HashL1Index(uint64_t Address) {
+    return Address ^ (Address >> L1_HASH_SHIFT);
+  }
+
   LookupCache(FEXCore::Context::ContextImpl* CTX);
   ~LookupCache();
 
@@ -190,7 +199,7 @@ public:
 
   uintptr_t FindBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t Address) {
     // Try L1, no lock needed
-    auto& L1Entry = reinterpret_cast<LookupCacheEntry*>(L1Pointer)[Address & L1PointerMask];
+    auto& L1Entry = reinterpret_cast<LookupCacheEntry*>(L1Pointer)[HashL1Index(Address) & L1PointerMask];
     if (L1Entry.GuestCode == Address) {
       return L1Entry.HostCode;
     }
@@ -328,7 +337,7 @@ public:
   // Invalidates L1/L2 for a given guest block
   void InvalidateCache(uint64_t Address, const LookupCacheWriteLockToken& lk) {
     // Do L1
-    auto& L1Entry = reinterpret_cast<LookupCacheEntry*>(L1Pointer)[Address & L1PointerMask];
+    auto& L1Entry = reinterpret_cast<LookupCacheEntry*>(L1Pointer)[HashL1Index(Address) & L1PointerMask];
     if (L1Entry.GuestCode == Address) {
       L1Entry.GuestCode = 0;
       // Leave L1Entry.HostCode as is, so that concurrent lookups won't read a null pointer
@@ -422,7 +431,7 @@ public:
 
 private:
   void AddL1Entry(uint64_t GuestAddress, uint64_t HostCode) {
-    auto& L1Entry = reinterpret_cast<LookupCacheEntry*>(L1Pointer)[GuestAddress & L1PointerMask];
+    auto& L1Entry = reinterpret_cast<LookupCacheEntry*>(L1Pointer)[HashL1Index(GuestAddress) & L1PointerMask];
     L1Entry.GuestCode = GuestAddress;
     L1Entry.HostCode = HostCode;
   }

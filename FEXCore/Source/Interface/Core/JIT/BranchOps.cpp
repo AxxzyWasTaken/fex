@@ -218,9 +218,10 @@ DEF_OP(ExitFunction) {
     // L1 Cache
     ldp<ARMEmitter::IndexType::OFFSET>(TMP1, TMP2, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.L1Pointer));
 
-    // Calculate (tmp1 + ((ripreg & L1_ENTRIES_MASK) << 4)) for the address
+    // Calculate (tmp1 + ((HashL1Index(ripreg) & L1_ENTRIES_MASK) << 4)) for the address
     // L1Mask is pre-shifted.
-    and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, RipReg, ARMEmitter::ShiftType::LSL, FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry)));
+    eor(ARMEmitter::Size::i64Bit, TMP3, RipReg, RipReg, ARMEmitter::ShiftType::LSR, LookupCache::L1_HASH_SHIFT);
+    and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, TMP3, ARMEmitter::ShiftType::LSL, FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry)));
     add(TMP1, TMP1, TMP2);
 
     ldp<ARMEmitter::IndexType::OFFSET>(TMP2, TMP1, TMP1, 0);

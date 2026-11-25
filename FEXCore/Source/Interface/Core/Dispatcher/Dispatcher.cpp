@@ -222,11 +222,12 @@ void Dispatcher::EmitDispatcher() {
       // If we've made it here then we have a real compiled block
       {
         // update L1 cache
-        ldp<ARMEmitter::IndexType::OFFSET>(TMP1, TMP2, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.L1Pointer));
-
-        // Calculate (tmp1 + ((ripreg & L1_ENTRIES_MASK) << 4)) for the address
-        // L1Mask is pre-shifted.
-        and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, RipReg.R(), ARMEmitter::ShiftType::LSL, FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry)));
+        // Calculate (L1Pointer + ((HashL1Index(ripreg) & L1_ENTRIES_MASK) << 4)) for the address.
+        // L1Mask is pre-shifted; TMP3 (RipReg) and TMP4 (HostCode) are live across this update.
+        eor(ARMEmitter::Size::i64Bit, TMP1, RipReg.R(), RipReg.R(), ARMEmitter::ShiftType::LSR, LookupCache::L1_HASH_SHIFT);
+        ldr(TMP2, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.L1Mask));
+        and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, TMP1.R(), ARMEmitter::ShiftType::LSL, FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry)));
+        ldr(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.L1Pointer));
         add(TMP1, TMP1, TMP2);
 
         stp<ARMEmitter::IndexType::OFFSET>(TMP4, RipReg, TMP1);
@@ -567,9 +568,10 @@ void Dispatcher::EmitDispatcher() {
       add(ARMEmitter::Size::i64Bit, TMP3, TMP3, rip_offset);
     }
 
-    // Calculate (tmp1 + ((ripreg & L1_ENTRIES_MASK) << 4)) for the address
+    // Calculate (tmp1 + ((HashL1Index(tmp3) & L1_ENTRIES_MASK) << 4)) for the address
     // L1Mask is pre-shifted.
-    and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, TMP3, ARMEmitter::ShiftType::LSL, FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry)));
+    eor(ARMEmitter::Size::i64Bit, TMP4, TMP3, TMP3, ARMEmitter::ShiftType::LSR, LookupCache::L1_HASH_SHIFT);
+    and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, TMP4, ARMEmitter::ShiftType::LSL, FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry)));
     add(TMP1, TMP1, TMP2);
 
     ldp<ARMEmitter::IndexType::OFFSET>(TMP2, TMP1, TMP1, 0);
