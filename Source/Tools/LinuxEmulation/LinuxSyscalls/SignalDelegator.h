@@ -225,6 +225,7 @@ private:
 
   bool InstallHostThunk(int Signal);
   bool UpdateHostThunk(int Signal);
+  void InstallOrUpdateRequiredHostThunk(int Signal, bool Required);
 
   bool IsAddressInDispatcher(uint64_t Address) const {
     return Address >= Config.DispatcherBegin && Address < Config.DispatcherEnd;
@@ -290,14 +291,17 @@ private:
     TYPE_NONREALTIME, ///< Signal restore type is from a `non-realtime` signal.
     TYPE_PAUSE,       ///< Signal restore type is from a GDB pause event.
   };
-  ArchHelpers::Context::ContextBackup* StoreThreadState(FEXCore::Core::InternalThreadState* Thread, int Signal, void* ucontext);
+  ArchHelpers::Context::ContextBackup* StoreThreadState(FEXCore::Core::InternalThreadState* Thread, int Signal, void* ucontext, bool IsGuestSignal);
   void RestoreThreadState(FEXCore::Core::InternalThreadState* Thread, void* ucontext, RestoreType Type);
   bool HandleDispatcherGuestSignal(FEXCore::Core::InternalThreadState* Thread, int Signal, void* info, void* ucontext,
                                    GuestSigAction* GuestAction, stack_t* GuestStack);
   bool HandleSignalPause(FEXCore::Core::InternalThreadState* Thread, int Signal, void* info, void* ucontext);
   bool HandleSIGILL(FEXCore::Core::InternalThreadState* Thread, int Signal, void* info, void* ucontext);
 
-  uint64_t GetNewSigMask(int Signal) const;
+  uint64_t GetGuestSignalHandlerMask(int Signal, uint64_t ExistingMask) const;
+  uint64_t MaskToHostSigMask(uint64_t GuestMask) const;
+  uint64_t GetDeferredSignalsMask(const FEX::HLE::ThreadStateObject* ThreadObject) const;
+  bool HasDeliverableDeferredSignal(const FEX::HLE::ThreadStateObject* ThreadObject) const;
 };
 
 fextl::unique_ptr<FEX::HLE::SignalDelegator>

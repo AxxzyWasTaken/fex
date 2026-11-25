@@ -491,6 +491,12 @@ void ThreadManager::UnlockAfterFork(FEXCore::Core::InternalThreadState* LiveThre
   auto ThreadObject = FEX::HLE::ThreadManager::GetStateObjectFromCPUState(LiveThread->CurrentFrame);
   Threads.push_back(ThreadObject);
 
+  // POSIX/Linux: a forked child starts with an empty pending signal set.
+  ThreadObject->SignalInfo.DeferredSignalFrameCount = 0;
+  ThreadObject->SignalInfo.PendingSignals = 0;
+  ThreadObject->SignalInfo.InSigSuspend = false;
+  mprotect(reinterpret_cast<void*>(&LiveThread->InterruptFaultPage), sizeof(LiveThread->InterruptFaultPage), PROT_READ | PROT_WRITE);
+
   // Clean up dead stacks
   FEXCore::Threads::Thread::CleanupAfterFork();
 

@@ -51,7 +51,6 @@ struct ThreadStateObject : public FEXCore::Allocator::FEXAllocOperators {
   struct DeferredSignalState {
     siginfo_t Info;
     int Signal;
-    uint64_t SigMask;
   };
   static constexpr size_t MAX_DEFERRED_SIGNALS = 64;
 
@@ -79,6 +78,7 @@ struct ThreadStateObject : public FEXCore::Allocator::FEXAllocOperators {
     FEX::HLE::GuestSAMask CurrentSignalMask {};
     // The mask prior to a suspend
     FEX::HLE::GuestSAMask PreviousSuspendMask {};
+    bool InSigSuspend {};
 
     uint64_t PendingSignals {};
 
