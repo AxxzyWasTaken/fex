@@ -1508,17 +1508,24 @@ uint64_t SignalDelegator::GuestSigSuspend(FEX::HLE::ThreadStateObject* Thread, u
   }
 
   constexpr uint64_t IgnoredSignalsMask = ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
+  // Read *set from guest memory before masking signals so bad pointers or MTRACK faults
+  // still fault cleanly with SIGSEGV unmasked.
   const uint64_t SuspendMask = *set & IgnoredSignalsMask;
-  const uint64_t SavedPreSuspendMask = Thread->SignalInfo.CurrentSignalMask.Val;
 
-  // Block async signals while transitioning into sigsuspend state so no async signal can
-  // consume InSigSuspend before rt_sigsuspend atomically installs HostSuspendMask.
+  // Mask all signals (including Required) before snapshotting CurrentSignalMask and
+  // transitioning PreviousSuspendMask, CurrentSignalMask, and InSigSuspend together, so
+  // no async signal can mutate CurrentSignalMask (via uc_sigmask) after the read and no
+  // cross-thread Required signal can observe SuspendMask while InSigSuspend is still false.
+  constexpr uint64_t AllSignals = ~0ULL;
   const uint64_t BlockAsyncMask = MaskToHostSigMask(~0ULL);
-  ::syscall(SYS_rt_sigprocmask, SIG_SETMASK, &BlockAsyncMask, nullptr, 8);
+  ::syscall(SYS_rt_sigprocmask, SIG_SETMASK, &AllSignals, nullptr, 8);
+  std::atomic_signal_fence(std::memory_order_seq_cst);
 
+  const uint64_t SavedPreSuspendMask = Thread->SignalInfo.CurrentSignalMask.Val;
   Thread->SignalInfo.PreviousSuspendMask.Val = SavedPreSuspendMask;
   Thread->SignalInfo.CurrentSignalMask.Val = SuspendMask;
   Thread->SignalInfo.InSigSuspend = true;
+  std::atomic_signal_fence(std::memory_order_seq_cst);
 
   // Deliver any FEX-queued deferred signals unblocked by SuspendMask before sleeping in host
   // rt_sigsuspend (the kernel does not know about FEX's per-thread deferred queue).
@@ -1527,17 +1534,20 @@ uint64_t SignalDelegator::GuestSigSuspend(FEX::HLE::ThreadStateObject* Thread, u
   // InSigSuspend), or drain ignored frames and continue to host rt_sigsuspend.
   while (Thread->SignalInfo.InSigSuspend && Thread->Thread && HasDeliverableDeferredSignal(Thread)) {
     mprotect(reinterpret_cast<void*>(&Thread->Thread->InterruptFaultPage), sizeof(Thread->Thread->InterruptFaultPage), PROT_NONE);
+    ::syscall(SYS_rt_sigprocmask, SIG_SETMASK, &BlockAsyncMask, nullptr, 8);
     std::atomic_signal_fence(std::memory_order_seq_cst);
     auto* FaultPage = reinterpret_cast<FEXCore::Core::NonAtomicRefCounter<uint64_t>*>(&Thread->Thread->InterruptFaultPage);
     FaultPage->Store(0);
     std::atomic_signal_fence(std::memory_order_seq_cst);
-    ::syscall(SYS_rt_sigprocmask, SIG_SETMASK, &BlockAsyncMask, nullptr, 8);
+    ::syscall(SYS_rt_sigprocmask, SIG_SETMASK, &AllSignals, nullptr, 8);
+    std::atomic_signal_fence(std::memory_order_seq_cst);
   }
 
   uint64_t Result = static_cast<uint64_t>(-EINTR);
   if (Thread->SignalInfo.InSigSuspend) {
-    // Move any overflow PendingSignals unblocked by SuspendMask into the kernel pending set so
-    // rt_sigsuspend wakes immediately (or Required signals fire immediately).
+    // Move any overflow PendingSignals unblocked by SuspendMask into the kernel pending set
+    // while AllSignals stays masked, so host rt_sigsuspend atomically unmasks HostSuspendMask
+    // and wakes immediately without a lost-wakeup window for cross-thread Required signals.
     const uint64_t DeliverablePending = ~SuspendMask & Thread->SignalInfo.PendingSignals;
     if (DeliverablePending != 0) {
       Thread->SignalInfo.PendingSignals &= ~DeliverablePending;
@@ -1548,24 +1558,16 @@ uint64_t SignalDelegator::GuestSigSuspend(FEX::HLE::ThreadStateObject* Thread, u
       }
       std::atomic_signal_fence(std::memory_order_seq_cst);
     }
-  }
 
-  // Mask all signals (including Required) across the final InSigSuspend check so a
-  // cross-thread Required signal cannot cause a lost wakeup before SYS_rt_sigsuspend
-  // atomically installs HostSuspendMask.
-  constexpr uint64_t AllSignals = ~0ULL;
-  ::syscall(SYS_rt_sigprocmask, SIG_SETMASK, &AllSignals, nullptr, 8);
-  std::atomic_signal_fence(std::memory_order_seq_cst);
-  if (Thread->SignalInfo.InSigSuspend) {
     const uint64_t HostSuspendMask = MaskToHostSigMask(SuspendMask | GetDeferredSignalsMask(Thread));
     const long SyscallRet = ::syscall(SYS_rt_sigsuspend, &HostSuspendMask, 8);
     Result = SyscallRet == -1 ? static_cast<uint64_t>(-errno) : static_cast<uint64_t>(SyscallRet);
   }
 
-  // Restore pre-suspend logical mask only if no guest signal handler interrupted sigsuspend
-  // (which clears InSigSuspend and lets rt_sigreturn install the guest frame's uc_sigmask,
-  // including any edits made by the handler). Sync the host mask and InterruptFaultPage from
-  // the resulting CurrentSignalMask.
+  // Re-mask AllSignals in case a guest signal handler ran and rt_sigreturn changed the host
+  // signal mask, then restore the pre-suspend logical mask only if no guest signal handler
+  // interrupted sigsuspend (which clears InSigSuspend and lets rt_sigreturn install the guest
+  // frame's uc_sigmask, including any edits made by the handler).
   ::syscall(SYS_rt_sigprocmask, SIG_SETMASK, &AllSignals, nullptr, 8);
   std::atomic_signal_fence(std::memory_order_seq_cst);
   if (Thread->SignalInfo.InSigSuspend) {
