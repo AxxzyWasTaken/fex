@@ -356,7 +356,14 @@ bool SignalDelegator::HandleDispatcherGuestSignal(FEXCore::Core::InternalThreadS
   // Spill the SRA regardless of signal handler type
   // We are going to be returning to the top of the dispatcher which will fill again
   // Otherwise we might load garbage
-  if (WasInJIT) {
+  // A thunk call sets IN_THUNK_CALL only once every static register is spilled to the frame, and clears it
+  // only once they are filled again. JIT or dispatcher code executing while IN_THUNK_CALL is set (DEF_OP(Thunk),
+  // CallbackPtr prologue, CallbackReturn epilogue) may hold clobbered host values in static host registers
+  // (notably x8 = guest RSP, which host thunks clobber with Linux syscall numbers). The frame holds the
+  // authoritative guest state, so neither spill nor refill SRA here.
+  const bool InThunkCall = (Frame->InSyscallInfo & FEXCore::Core::CpuStateFrame::IN_THUNK_CALL) != 0;
+
+  if (WasInJIT && !InThunkCall) {
     uint32_t IgnoreMask {};
 #ifdef ARCHITECTURE_arm64
     if (Frame->InSyscallInfo != 0) {
@@ -375,7 +382,10 @@ bool SignalDelegator::HandleDispatcherGuestSignal(FEXCore::Core::InternalThreadS
     SpillSRA(Thread, ucontext, IgnoreMask);
 
     ContextBackup->Flags |= ArchHelpers::Context::ContextFlags::CONTEXT_FLAG_INJIT;
-  } else if (IsAddressInDispatcher(OldPC)) {
+  } else if (WasInJIT && InThunkCall) {
+    // Reconstruct the thunk instruction RIP without touching the already-spilled static registers.
+    Frame->State.rip = CTX->RestoreRIPFromHostPC(Thread, OldPC);
+  } else if (IsAddressInDispatcher(OldPC) && !InThunkCall) {
     // Signals only arrive at points where the dispatcher holds the guest state in both the frame and the static registers.
     ContextBackup->Flags |= ArchHelpers::Context::ContextFlags::CONTEXT_FLAG_INDISPATCHER;
   }
@@ -511,14 +521,15 @@ bool SignalDelegator::HandleSignalPause(FEXCore::Core::InternalThreadState* Thre
     // Store our thread state so we can come back to this
     StoreThreadState(Thread, Signal, ucontext, false);
 
-    if (CTX->IsAddressInCodeBuffer(Thread, ArchHelpers::Context::GetPc(ucontext))) {
+    const bool InThunkCall = (Frame->InSyscallInfo & FEXCore::Core::CpuStateFrame::IN_THUNK_CALL) != 0;
+    if (CTX->IsAddressInCodeBuffer(Thread, ArchHelpers::Context::GetPc(ucontext)) && !InThunkCall) {
       // We are in jit, SRA must be spilled
       ArchHelpers::Context::SetPc(ucontext, Config.ThreadPauseHandlerAddressSpillSRA);
     } else {
       // We are in non-jit, SRA is already spilled
 #if defined(ASSERTIONS_ENABLED) && ASSERTIONS_ENABLED
-      LOGMAN_THROW_A_FMT(!IsAddressInDispatcher(ArchHelpers::Context::GetPc(ucontext)), "Signals in dispatcher have unsynchronized "
-                                                                                        "context");
+      LOGMAN_THROW_A_FMT(!IsAddressInDispatcher(ArchHelpers::Context::GetPc(ucontext)) || InThunkCall, "Signals in dispatcher have "
+                                                                                                       "unsynchronized context");
 #endif
       ArchHelpers::Context::SetPc(ucontext, Config.ThreadPauseHandlerAddress);
     }
@@ -544,14 +555,15 @@ bool SignalDelegator::HandleSignalPause(FEXCore::Core::InternalThreadState* Thre
     Thread->CurrentFrame->SignalHandlerRefCounter = 0;
 
     // Set the new PC
-    if (CTX->IsAddressInCodeBuffer(Thread, ArchHelpers::Context::GetPc(ucontext))) {
+    const bool InThunkCall = (Frame->InSyscallInfo & FEXCore::Core::CpuStateFrame::IN_THUNK_CALL) != 0;
+    if (CTX->IsAddressInCodeBuffer(Thread, ArchHelpers::Context::GetPc(ucontext)) && !InThunkCall) {
       // We are in jit, SRA must be spilled
       ArchHelpers::Context::SetPc(ucontext, Config.ThreadStopHandlerAddressSpillSRA);
     } else {
       // We are in non-jit, SRA is already spilled
 #if defined(ASSERTIONS_ENABLED) && ASSERTIONS_ENABLED
-      LOGMAN_THROW_A_FMT(!IsAddressInDispatcher(ArchHelpers::Context::GetPc(ucontext)), "Signals in dispatcher have unsynchronized "
-                                                                                        "context");
+      LOGMAN_THROW_A_FMT(!IsAddressInDispatcher(ArchHelpers::Context::GetPc(ucontext)) || InThunkCall, "Signals in dispatcher have "
+                                                                                                       "unsynchronized context");
 #endif
       ArchHelpers::Context::SetPc(ucontext, Config.ThreadStopHandlerAddress);
     }
