@@ -189,7 +189,9 @@ public:
   FEX::HLE::ThreadStateObject* CreateThread(const FEXCore::Core::CPUState* NewThreadState = nullptr, uint64_t ParentTID = 0,
                                             FEX::HLE::ThreadStateObject* InheritThread = nullptr);
   void TrackThread(FEX::HLE::ThreadStateObject* Thread) {
-    std::lock_guard lk(ThreadCreationMutex);
+    // Mask signals on the calling thread rather than using Thread's deferred refcount:
+    // TrackThread is called from the parent thread in CreateNewThread and before RegisterTLSState.
+    auto lk = FEXCore::MaskSignalsAndLockMutex(ThreadCreationMutex);
     Threads.emplace_back(Thread);
   }
 
@@ -217,13 +219,12 @@ public:
 
   // Runs Fn with no code being compiled, passing it a function that invalidates the code of one guest range. Ranges invalidated
   // in one call can't get new code until Fn returns.
+  // Passing CallingThread == nullptr (early init or inside a SIGSEGV handler) masks signals instead of touching InterruptFaultPage.
   void InvalidateGuestCodeRanges(FEXCore::Core::InternalThreadState* CallingThread, auto&& Fn) {
-    std::lock_guard lk(ThreadCreationMutex);
-
-    // Potential deferred since Thread might not be valid.
-    // Thread object isn't valid very early in frontend's initialization.
-    // To be more optimal the frontend should provide this code with a valid Thread object earlier.
-    auto CodeInvalidationlk = FEXCore::GuardSignalDeferringSectionWithFallback(CTX->GetCodeInvalidationMutex(), CallingThread);
+    // Defer/mask signals before acquiring ThreadCreationMutex so an async signal cannot enter a guest handler
+    // while holding ThreadCreationMutex or CodeInvalidationMutex (and so deferred signals fire only after both unlock).
+    auto ThreadCreationlk = FEXCore::GuardSignalDeferringSectionWithFallback(ThreadCreationMutex, CallingThread);
+    std::lock_guard CodeInvalidationlk(CTX->GetCodeInvalidationMutex());
     Fn([this](uint64_t Start, uint64_t Length) {
       CTX->InvalidateCodeBuffersCodeRange(Start, Length);
       for (auto& Thread : Threads) {

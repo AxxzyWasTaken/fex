@@ -102,7 +102,7 @@ uint32_t ThreadManager::StatAlloc::FrontendAllocateSlots(uint32_t NewSize) {
 }
 
 FEXCore::SHMStats::ThreadStats* ThreadManager::StatAlloc::AllocateSlot(uint32_t TID) {
-  std::scoped_lock lk(StatMutex);
+  auto lk = FEXCore::MaskSignalsAndLockMutex(StatMutex);
   return StatAllocBase::AllocateSlot(TID);
 }
 
@@ -111,7 +111,7 @@ void ThreadManager::StatAlloc::DeallocateSlot(FEXCore::SHMStats::ThreadStats* Al
     return;
   }
 
-  std::scoped_lock lk(StatMutex);
+  auto lk = FEXCore::MaskSignalsAndLockMutex(StatMutex);
   StatAllocBase::DeallocateSlot(AllocatedSlot);
 }
 
@@ -251,7 +251,9 @@ ThreadManager::CreateThread(const FEXCore::Core::CPUState* NewThreadState, uint6
 
 void ThreadManager::DestroyThread(FEX::HLE::ThreadStateObject* Thread, bool NeedsTLSUninstall) {
   {
-    std::lock_guard lk(ThreadCreationMutex);
+    // Mask signals on the calling thread rather than using Thread's deferred refcount:
+    // DestroyThread runs after UninstallTLSState on exiting threads and on the parent thread for CLONE_VFORK.
+    auto lk = FEXCore::MaskSignalsAndLockMutex(ThreadCreationMutex);
     auto It = std::find(Threads.begin(), Threads.end(), Thread);
     LOGMAN_THROW_A_FMT(It != Threads.end(), "Thread wasn't in Threads");
     Threads.erase(It);

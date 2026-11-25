@@ -20,6 +20,7 @@ $end_info$
 #include <FEXCore/Utils/MathUtils.h>
 #include <FEXCore/Utils/FPState.h>
 #include <FEXCore/Utils/Profiler.h>
+#include <FEXCore/Utils/SignalScopeGuards.h>
 #include <FEXCore/Utils/ArchHelpers/Arm64.h>
 #include <FEXHeaderUtils/Syscalls.h>
 
@@ -1148,37 +1149,53 @@ void SignalDelegator::RegisterFrontendHostSignalHandler(int Signal, HostSignalDe
 }
 
 uint64_t SignalDelegator::RegisterGuestSignalHandler(int Signal, const GuestSigAction* Action, GuestSigAction* OldAction) {
-  std::lock_guard lk(GuestDelegatorMutex);
-
   // Invalid signal specified
   if (Signal > MAX_SIGNALS) {
     return -EINVAL;
   }
 
-  // If we have an old signal set then give it back
-  if (OldAction) {
-    *OldAction = HostHandlers[Signal].GuestAction;
+  // These signal dispositions can't be changed on Linux
+  if (Action && (Signal == SIGKILL || Signal == SIGSTOP)) {
+    return -EINVAL;
   }
 
-  // Now assign the new action
+  // Copy Action from guest memory before masking SIGSEGV so any MTRACK write-protection fault
+  // or bad guest pointer is handled normally instead of killing the process while SIGSEGV is masked.
+  GuestSigAction NewAction {};
   if (Action) {
-    // These signal dispositions can't be changed on Linux
-    if (Signal == SIGKILL || Signal == SIGSTOP) {
-      return -EINVAL;
+    NewAction = *Action;
+  }
+
+  GuestSigAction SavedOldAction {};
+  {
+    // Mask signals while holding GuestDelegatorMutex so an async signal cannot suspend this thread
+    // (or re-enter via SA_RESETHAND in HandleDispatcherGuestSignal) while holding the lock.
+    auto lk = FEXCore::MaskSignalsAndLockMutex(GuestDelegatorMutex);
+
+    if (OldAction) {
+      SavedOldAction = HostHandlers[Signal].GuestAction;
     }
 
-    HostHandlers[Signal].GuestAction = *Action;
-    // Only attempt to install a new thunk handler if we were installing a new guest action
-    if (!InstallHostThunk(Signal)) {
-      UpdateHostThunk(Signal);
+    // Now assign the new action
+    if (Action) {
+      HostHandlers[Signal].GuestAction = NewAction;
+      // Only attempt to install a new thunk handler if we were installing a new guest action
+      if (!InstallHostThunk(Signal)) {
+        UpdateHostThunk(Signal);
+      }
     }
+  }
+
+  // Write OldAction back to guest memory after unmasking SIGSEGV.
+  if (OldAction) {
+    *OldAction = SavedOldAction;
   }
 
   return 0;
 }
 
 void SignalDelegator::CheckXIDHandler() {
-  std::lock_guard lk(GuestDelegatorMutex);
+  auto lk = FEXCore::MaskSignalsAndLockMutex(GuestDelegatorMutex);
   std::lock_guard lk2(HostDelegatorMutex);
 
   constexpr size_t SIGNAL_SETXID = 33;
