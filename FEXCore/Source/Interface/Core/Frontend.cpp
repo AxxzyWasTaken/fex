@@ -1136,6 +1136,9 @@ Decoder::DecodedBlockStatus Decoder::DecodeInstruction(uint64_t PC) {
     // A decode error can be caused by substituting zero for an inaccessible
     // instruction byte, so the instruction fetch fault takes priority.
     if (HitNonExecutableRange) {
+      // The fault is at the first byte that couldn't be read. The zeros read in its place can make the decode fail before
+      // the instruction's size is recorded, so take the size from the bytes that were read.
+      DecodeInst->InstSize = InstructionSize;
       return DecodeInst->InstSize ? DecodedBlockStatus::PARTIAL_DECODE_INST : DecodedBlockStatus::NOEXEC_INST;
     }
 
