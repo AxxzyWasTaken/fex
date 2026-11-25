@@ -1221,7 +1221,11 @@ namespace DiskCache {
       }
     }
 
-    memcpy(BlobData + GuestCodeOffset, GuestCode.data(), GuestCode.size());
+    // Copy only the decoded extents: a multiblock can branch over bytes it never decoded, and those need not be readable
+    // (a no-access page between two code pages). Validation compares only the extents; the rest stays zero.
+    for (uint32_t i = 0; i < ExactGuestCodeExtents.size(); i += 2) {
+      memcpy(BlobData + GuestCodeOffset + ExactGuestCodeExtents[i], GuestCode.data() + ExactGuestCodeExtents[i], ExactGuestCodeExtents[i + 1]);
+    }
 
     MesaFOZ::foz_payload_key Key = {};
     {
