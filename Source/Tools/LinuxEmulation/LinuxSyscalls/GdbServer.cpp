@@ -112,7 +112,7 @@ GdbServer::GdbServer(FEXCore::Context::Context* ctx, FEX::HLE::SignalDelegator* 
         ThreadObject->GdbInfo = {};
         ThreadObject->GdbInfo->Signal = Signal;
 
-        this->SignalDelegation->SpillSRA(Thread, ucontext, Thread->CurrentFrame->InSyscallInfo);
+        this->SignalDelegation->SpillSRA(Thread, ucontext, Thread->CurrentFrame->InSyscallInfo & 0xFFFF);
 
         // Let GDB know that we have a signal
         this->Break(Thread, Signal);
