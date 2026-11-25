@@ -1422,26 +1422,32 @@ uint64_t SignalDelegator::GuestSigProcMask(FEX::HLE::ThreadStateObject* Thread, 
   // 1) Store old mask
   // 2) Set mask to new mask if exists
   // 3) Give old mask back
-  auto OldSet = Thread->SignalInfo.CurrentSignalMask.Val;
+  uint64_t OldSet {};
 
   if (set) {
-    constexpr uint64_t IgnoredSignalsMask = ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
-    uint64_t NewMask = OldSet;
-    if (how == SIG_BLOCK) {
-      NewMask |= *set & IgnoredSignalsMask;
-    } else if (how == SIG_UNBLOCK) {
-      NewMask &= ~(*set & IgnoredSignalsMask);
-    } else if (how == SIG_SETMASK) {
-      NewMask = *set & IgnoredSignalsMask;
-    } else {
+    if (how != SIG_BLOCK && how != SIG_UNBLOCK && how != SIG_SETMASK) {
       return -EINVAL;
     }
 
-    if (Thread->SignalInfo.DeferredSignalFrameCount != 0) {
-      // Mask signals while updating CurrentSignalMask and inspecting DeferredSignalFrames so an
-      // async signal cannot mutate DeferredSignalFrames before we install HostMask.
-      constexpr uint64_t AllSignals = ~0ULL;
-      ::syscall(SYS_rt_sigprocmask, SIG_SETMASK, &AllSignals, nullptr, 8);
+    // Read *set from guest memory before masking SIGSEGV so a bad guest pointer or MTRACK fault
+    // is handled normally rather than crashing with SIGSEGV blocked.
+    constexpr uint64_t IgnoredSignalsMask = ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
+    const uint64_t MaskedSet = *set & IgnoredSignalsMask;
+
+    // Unconditionally mask all signals while reading/updating CurrentSignalMask, inspecting
+    // DeferredSignalFrames, syncing InterruptFaultPage, and installing HostMask so an async
+    // signal cannot race in between and leave HostMask or DeferredSignalFrames inconsistent.
+    constexpr uint64_t AllSignals = ~0ULL;
+    ::syscall(SYS_rt_sigprocmask, SIG_SETMASK, &AllSignals, nullptr, 8);
+
+    OldSet = Thread->SignalInfo.CurrentSignalMask.Val;
+    uint64_t NewMask = OldSet;
+    if (how == SIG_BLOCK) {
+      NewMask |= MaskedSet;
+    } else if (how == SIG_UNBLOCK) {
+      NewMask &= ~MaskedSet;
+    } else {
+      NewMask = MaskedSet;
     }
 
     Thread->SignalInfo.CurrentSignalMask.Val = NewMask;
@@ -1457,6 +1463,8 @@ uint64_t SignalDelegator::GuestSigProcMask(FEX::HLE::ThreadStateObject* Thread, 
     }
 
     ::syscall(SYS_rt_sigprocmask, SIG_SETMASK, &HostMask, nullptr, 8);
+  } else {
+    OldSet = Thread->SignalInfo.CurrentSignalMask.Val;
   }
 
   if (oldset) {
