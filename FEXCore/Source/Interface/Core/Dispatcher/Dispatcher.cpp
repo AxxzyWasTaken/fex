@@ -28,6 +28,9 @@
 #include <array>
 #include <bit>
 #include <cstring>
+#if !defined(_WIN32) && defined(ARCHITECTURE_arm64)
+#include <sys/syscall.h>
+#endif
 
 namespace FEXCore::CPU {
 
@@ -582,20 +585,183 @@ void Dispatcher::EmitDispatcher() {
   };
 
   {
-    // All dynamic and static registers are spilled coming in to this handler.
-    // It's also the end of block and RIP might have changed, so we jump directly to the top of the loop.
+    // Dynamic registers are dead and stack is reset coming into this handler.
+    // Static registers are spilled here so direct-passthrough syscalls can avoid
+    // spilling/filling static FPRs (v16..v31) and serializing FPCR updates.
     ThreadDispatchSyscallHandler = GetCursorAddress<uint64_t>();
 
-    // Store in the state that we are in a syscall
-    // 16bit LoadConstant to be a single instruction
-    // This gives the signal handler a value to check to see if we are in a syscall at all
-    LoadConstant(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r0, 0xFFFF);
-    str(ARMEmitter::XReg::x0, STATE, offsetof(FEXCore::Core::CpuStateFrame, InSyscallInfo));
+#if !defined(_WIN32) && !defined(ARCHITECTURE_arm64ec) && !defined(VIXL_SIMULATOR)
+    // Disable when SVE is active: raw ARM64 Linux svc #0 discards SVE predicate and upper Z state.
+    const bool EnableDirectPassthrough = !CTX->HostFeatures.SupportsSVE() && CTX->Config.Is64BitMode && CTX->SyscallHandler &&
+                                         CTX->SyscallHandler->SupportsDirectSyscallPassthrough();
+#else
+    constexpr bool EnableDirectPassthrough = false;
+#endif
 
-    if (CTX->Config.NeedsPendingInterruptFaultCheck) {
-      // Take pending signals before the syscall, which may block. Signals that arrive from here on are taken right away, as
-      // the thread is marked as in a syscall. The guest state is all in the frame.
-      EmitPendingInterruptFaultCheck();
+    if (EnableDirectPassthrough) {
+      constexpr uint64_t X64_SYS_IOCTL = 16;
+      constexpr uint64_t X64_SYS_SCHED_YIELD = 24;
+      constexpr uint64_t X64_SYS_FUTEX = 202;
+      constexpr uint64_t X64_IOCTL_TYPE_UFFDIO = 0xAA;
+
+      constexpr uint64_t ARM64_SYS_IOCTL = 29;
+      constexpr uint64_t ARM64_SYS_FUTEX = 98;
+      constexpr uint64_t ARM64_SYS_SCHED_YIELD = 124;
+#if !defined(_WIN32) && defined(ARCHITECTURE_arm64)
+      static_assert(ARM64_SYS_IOCTL == SYS_ioctl);
+      static_assert(ARM64_SYS_FUTEX == SYS_futex);
+      static_assert(ARM64_SYS_SCHED_YIELD == SYS_sched_yield);
+#endif
+
+      // Spill static GPRs, NZCV, PF/AF, and callret_sp first (no FPR spill, no FPCR touch).
+      // InSyscallInfo is still 0, so BetweenChecks defers async signals across this spill.
+      SpillStaticRegs(TMP1, {
+                              .FPRs = false,
+                              .FPCR = false,
+                            });
+
+      // Mark InSyscallInfo with 0xFFFF (all static GPRs spilled) | SRA_FPR_UNSPILLED
+      // (static FPRs v16..v31 live in hardware regs / ucontext) before checking pending signals
+      // or writing x8 (guest RSP) so GdbServer SpillSRA never sees a syscall nr as guest RSP.
+      LoadConstant(ARMEmitter::Size::i64Bit, TMP1, 0xFFFFULL | FEXCore::Core::CpuStateFrame::SRA_FPR_UNSPILLED);
+      str(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, InSyscallInfo));
+
+      if (CTX->Config.NeedsPendingInterruptFaultCheck) {
+        // Flush pending deferred signals before inspecting HasSeccompFilter, RAX, or RSI
+        // so a guest signal handler modifying RAX/RSI or installing a seccomp filter takes
+        // effect and cannot bypass UFFDIO/seccomp handling or run a stale syscall number.
+        EmitPendingInterruptFaultCheck();
+      }
+
+      ARMEmitter::ForwardLabel SlowPath;
+      ARMEmitter::ForwardLabel FastIoctl;
+      ARMEmitter::ForwardLabel FastFutex;
+      ARMEmitter::ForwardLabel FastSchedYield;
+      ARMEmitter::ForwardLabel FastDoSvc;
+
+      // Fall back to the full C++ syscall handler whenever emulated seccomp filters are active.
+      ldr(TMP1.W(), STATE, offsetof(FEXCore::Core::CpuStateFrame, HasSeccompFilter));
+      (void)cbnz(ARMEmitter::Size::i32Bit, TMP1, &SlowPath);
+
+      // Read guest RAX from Frame->State (authoritative after any deferred signal delivery).
+      ldr(TMP1, STATE, ARRAY_OFFSETOF(FEXCore::Core::CpuStateFrame, State.gregs, FEXCore::X86State::REG_RAX));
+      cmp(ARMEmitter::Size::i64Bit, TMP1, X64_SYS_IOCTL);
+      (void)b(ARMEmitter::Condition::CC_EQ, &FastIoctl);
+      cmp(ARMEmitter::Size::i64Bit, TMP1, X64_SYS_FUTEX);
+      (void)b(ARMEmitter::Condition::CC_EQ, &FastFutex);
+      cmp(ARMEmitter::Size::i64Bit, TMP1, X64_SYS_SCHED_YIELD);
+      (void)b(ARMEmitter::Condition::CC_EQ, &FastSchedYield);
+      (void)b(&SlowPath);
+
+      (void)Bind(&FastIoctl);
+      // Userfaultfd ioctls (_IOC_TYPE(request) == UFFDIO) need FEX emulation.
+      ldr(TMP1, STATE, ARRAY_OFFSETOF(FEXCore::Core::CpuStateFrame, State.gregs, FEXCore::X86State::REG_RSI));
+      ubfx(ARMEmitter::Size::i64Bit, TMP1, TMP1, 8, 8);
+      cmp(ARMEmitter::Size::i64Bit, TMP1, X64_IOCTL_TYPE_UFFDIO);
+      (void)b(ARMEmitter::Condition::CC_EQ, &SlowPath);
+      LoadConstant(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r8, ARM64_SYS_IOCTL);
+      (void)b(&FastDoSvc);
+
+      (void)Bind(&FastFutex);
+      LoadConstant(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r8, ARM64_SYS_FUTEX);
+      (void)b(&FastDoSvc);
+
+      (void)Bind(&FastSchedYield);
+      LoadConstant(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r8, ARM64_SYS_SCHED_YIELD);
+
+      (void)Bind(&FastDoSvc);
+      // Load x86-64 syscall arguments from Frame->State.gregs (after EmitPendingInterruptFaultCheck
+      // so any guest signal handler edits to argument registers take effect).
+      // ARM64 syscall ABI: x0=RDI, x1=RSI, x2=RDX, x3=R10, x4=R8, x5=R9, x8=nr.
+      static_assert(FEXCore::X86State::REG_RDI == FEXCore::X86State::REG_RSI + 1);
+      static_assert(FEXCore::X86State::REG_R9 == FEXCore::X86State::REG_R8 + 1);
+      ldp<ARMEmitter::IndexType::OFFSET>(ARMEmitter::XReg::x1, ARMEmitter::XReg::x0, STATE,
+                                         ARRAY_OFFSETOF(FEXCore::Core::CpuStateFrame, State.gregs, FEXCore::X86State::REG_RSI));
+      ldr(ARMEmitter::XReg::x2, STATE, ARRAY_OFFSETOF(FEXCore::Core::CpuStateFrame, State.gregs, FEXCore::X86State::REG_RDX));
+      ldr(ARMEmitter::XReg::x3, STATE, ARRAY_OFFSETOF(FEXCore::Core::CpuStateFrame, State.gregs, FEXCore::X86State::REG_R10));
+      ldp<ARMEmitter::IndexType::OFFSET>(ARMEmitter::XReg::x4, ARMEmitter::XReg::x5, STATE,
+                                         ARRAY_OFFSETOF(FEXCore::Core::CpuStateFrame, State.gregs, FEXCore::X86State::REG_R8));
+
+      // ARM64 Linux svc #0 architecturally preserves x9..x30, SP, v0..v31, and FPCR.
+      svc(0);
+
+      if (CTX->Config.NeedsPendingInterruptFaultCheck) {
+        // Defer async signals across storing RAX/RIP, refilling static GPRs, and clearing InSyscallInfo
+        // so a signal cannot observe a partial return state or partially refilled GPRs.
+        ldr(ARMEmitter::XReg::x1, STATE, offsetof(FEXCore::Core::CPUState, DeferredSignalRefCount));
+        add(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r1, ARMEmitter::Reg::r1, 1);
+        str(ARMEmitter::XReg::x1, STATE, offsetof(FEXCore::Core::CPUState, DeferredSignalRefCount));
+      }
+
+      // Write syscall return value to guest RAX and advance RIP past the 2-byte syscall instruction.
+      str(ARMEmitter::XReg::x0, STATE, ARRAY_OFFSETOF(FEXCore::Core::CpuStateFrame, State.gregs, FEXCore::X86State::REG_RAX));
+      ldr(ARMEmitter::XReg::x1, STATE_PTR(CpuStateFrame, State.rip));
+      add(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r1, ARMEmitter::Reg::r1, 2);
+      str(ARMEmitter::XReg::x1, STATE_PTR(CpuStateFrame, State.rip));
+
+      // Refill static GPRs, NZCV, PF/AF, and callret_sp without touching FPRs or FPCR.
+      FillStaticRegs({
+        .OptionalReg = ARMEmitter::Reg::r1,
+        .OptionalReg2 = ARMEmitter::Reg::r2,
+        .FPRs = false,
+        .FPCR = false,
+      });
+
+      // Clear InSyscallInfo now that all static GPRs are back in host registers.
+      str(ARMEmitter::XReg::zr, STATE, offsetof(FEXCore::Core::CpuStateFrame, InSyscallInfo));
+
+      if (CTX->Config.NeedsPendingInterruptFaultCheck) {
+        // Decrement DeferredSignalRefCount without faulting inside the dispatcher: Frame->State.xmm
+        // was never spilled on this NoFP path, whereas SignalDelegator assumes dispatcher signals
+        // with InSyscallInfo == 0 hold synced guest state in both Frame->State and registers.
+        // EmitL1Lookup() immediately reaches the next JIT block entry (or NoBlock full spill),
+        // where EmitPendingInterruptFaultCheck() fires with WasInJIT == true and spills full SRA.
+        ldr(ARMEmitter::XReg::x1, STATE, offsetof(FEXCore::Core::CPUState, DeferredSignalRefCount));
+        sub(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r1, ARMEmitter::Reg::r1, 1);
+        str(ARMEmitter::XReg::x1, STATE, offsetof(FEXCore::Core::CPUState, DeferredSignalRefCount));
+      }
+
+      EmitL1Lookup();
+
+      // Slow path: finish spilling static FPRs and disabling AFP in FPCR before calling C++.
+      (void)Bind(&SlowPath);
+      if (CTX->Config.NeedsPendingInterruptFaultCheck) {
+        // Defer async signals across the FPR/FPCR spill and clearing SRA_FPR_UNSPILLED so a signal
+        // cannot observe partially-spilled FPRs or cleared AFP while SRA_FPR_UNSPILLED is still set.
+        ldr(TMP1, STATE, offsetof(FEXCore::Core::CPUState, DeferredSignalRefCount));
+        add(ARMEmitter::Size::i64Bit, TMP1, TMP1, 1);
+        str(TMP1, STATE, offsetof(FEXCore::Core::CPUState, DeferredSignalRefCount));
+      }
+      SpillStaticRegs(TMP1, {
+                              .GPRSpillMask = 0,
+                              .FPRs = true,
+                              .NZCV = false,
+                              .FPCR = true,
+                            });
+      // Clear SRA_FPR_UNSPILLED now that static FPRs are in Frame->State and AFP is disabled.
+      LoadConstant(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r0, 0xFFFF);
+      str(ARMEmitter::XReg::x0, STATE, offsetof(FEXCore::Core::CpuStateFrame, InSyscallInfo));
+      if (CTX->Config.NeedsPendingInterruptFaultCheck) {
+        ldr(TMP1, STATE, offsetof(FEXCore::Core::CPUState, DeferredSignalRefCount));
+        sub(ARMEmitter::Size::i64Bit, TMP1, TMP1, 1);
+        str(TMP1, STATE, offsetof(FEXCore::Core::CPUState, DeferredSignalRefCount));
+        // Flush any signal deferred during the FPR spill above before calling the C++ handler.
+        EmitPendingInterruptFaultCheck();
+      }
+    } else {
+      SpillStaticRegs(TMP1);
+
+      // Store in the state that we are in a syscall
+      // 16bit LoadConstant to be a single instruction
+      // This gives the signal handler a value to check to see if we are in a syscall at all
+      LoadConstant(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r0, 0xFFFF);
+      str(ARMEmitter::XReg::x0, STATE, offsetof(FEXCore::Core::CpuStateFrame, InSyscallInfo));
+
+      if (CTX->Config.NeedsPendingInterruptFaultCheck) {
+        // Take pending signals before the syscall, which may block. Signals that arrive from here on are taken right away, as
+        // the thread is marked as in a syscall. The guest state is all in the frame.
+        EmitPendingInterruptFaultCheck();
+      }
     }
 
     ldr(ARMEmitter::XReg::x0, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.SyscallHandlerObj));

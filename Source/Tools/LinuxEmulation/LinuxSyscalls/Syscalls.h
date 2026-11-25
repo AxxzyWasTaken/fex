@@ -134,6 +134,14 @@ public:
 
   void HandleSyscall(FEXCore::Core::CpuStateFrame* Frame) final override;
 
+  bool SupportsDirectSyscallPassthrough() const override {
+#if defined(ARCHITECTURE_arm64) && !defined(DEBUG_STRACE)
+    return Is64BitMode();
+#else
+    return false;
+#endif
+  }
+
   void DefaultProgramBreak(uint64_t Base, uint64_t Size);
   void DeserializeSeccompFD(FEX::HLE::ThreadStateObject* Thread, int FD) {
     if (FD == -1) {

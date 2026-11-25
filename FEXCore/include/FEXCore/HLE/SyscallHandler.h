@@ -34,6 +34,13 @@ public:
 
   virtual void HandleSyscall(FEXCore::Core::CpuStateFrame* Frame) = 0;
 
+  /// Returns true if the frontend supports the dispatcher's direct ARM64 Linux kernel
+  /// passthrough fast path for x86-64 ioctl (non-UFFDIO), futex, and sched_yield syscalls
+  /// when no seccomp filter is installed on the calling thread.
+  virtual bool SupportsDirectSyscallPassthrough() const {
+    return false;
+  }
+
   virtual void MarkGuestExecutableRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) {}
   virtual void InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) {}
   virtual void MarkOvercommitRange(uint64_t Start, uint64_t Length) {}

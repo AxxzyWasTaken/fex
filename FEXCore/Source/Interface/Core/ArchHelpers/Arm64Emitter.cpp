@@ -736,7 +736,9 @@ void Arm64Emitter::SpillStaticRegs(ARMEmitter::Register TmpReg, SpillStaticRegOp
   unsigned PFAFSpillMask = Options.GPRSpillMask & PFAFMask;
   Options.GPRSpillMask &= ~PFAFSpillMask;
 
-  str(REG_CALLRET_SP, STATE.R(), offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp));
+  if (Options.GPRSpillMask != 0) {
+    str(REG_CALLRET_SP, STATE.R(), offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp));
+  }
 
   for (size_t i = 0; i < StaticRegisters.size(); i += 2) {
     auto Reg1 = StaticRegisters[i];
@@ -776,7 +778,7 @@ void Arm64Emitter::SpillStaticRegs(ARMEmitter::Register TmpReg, SpillStaticRegOp
         }
       }
     } else {
-      if (Options.GPRSpillMask && Options.FPRSpillMask == ~0U) {
+      if (Options.FPRSpillMask == ~0U) {
         // Optimize the common case where we can spill four registers per instruction
         // Load the sse offset in to the temporary register
         add(ARMEmitter::Size::i64Bit, TmpReg, STATE.R(), offsetof(FEXCore::Core::CpuStateFrame, State.xmm.sse.data));
