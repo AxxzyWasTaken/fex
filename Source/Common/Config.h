@@ -68,6 +68,14 @@ bool IsSecureExecution();
 void LoadConfig(fextl::string ProgramName = {}, char** const envp = nullptr, const PortableInformation& PortableInfo = {},
                 bool SecureExecution = IsSecureExecution());
 
+/**
+ * @brief The config files searched for a ThunksDB section, lowest priority first
+ *
+ * @param AppName The application's config name
+ * @param ThunkConfigFile The ThunkConfig option's file
+ */
+fextl::vector<fextl::string> GetThunksDBConfigPaths(const fextl::string& AppName, const fextl::string& ThunkConfigFile);
+
 fextl::string GetHomeDirectory();
 
 fextl::string GetDataDirectory(bool Global, const PortableInformation& PortableInfo);

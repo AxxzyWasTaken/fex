@@ -443,9 +443,10 @@ int main(int argc, char** argv, char** const envp) {
     }
   }
 
-  // Ensure FEXServer is setup before config options try to pull CONFIG_ROOTFS
+  // Ensure FEXServer is setup before config options try to pull CONFIG_ROOTFS.
+  // With credentials the caller did not have, FEX runs without one and keeps the system config's RootFS.
   auto SelfPath = FEX::GetSelfPath();
-  if (!FEXServerClient::SetupClient(SelfPath.value_or(argv[0]))) {
+  if (!SecureExecution && !FEXServerClient::SetupClient(SelfPath.value_or(argv[0]))) {
     // Sandboxes (a Flatpak app run through binfmt_misc) can reach neither the host's FEXServer
     // nor its binary: Flatpak's ldconfig step has no network namespace, host paths or even
     // /.flatpak-info. The sandbox's runtime is the rootfs there, so carry on without the server
