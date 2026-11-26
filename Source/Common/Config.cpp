@@ -21,6 +21,8 @@
 #ifndef _WIN32
 #include <linux/limits.h>
 #include <pwd.h>
+#include <sys/auxv.h>
+#include <unistd.h>
 #endif
 #include <optional>
 #include <utility>
@@ -484,10 +486,37 @@ ApplicationNames GetApplicationNames(const fextl::vector<fextl::string>& Args, b
   return ApplicationNames {std::move(Program), std::move(ProgramName)};
 }
 
-void LoadConfig(fextl::string ProgramName, char** const envp, const PortableInformation& PortableInfo) {
+bool IsSecureExecution() {
+#ifndef _WIN32
+  return getauxval(AT_SECURE) != 0 || getuid() != geteuid() || getgid() != getegid();
+#else
+  return false;
+#endif
+}
+
+void LoadConfig(fextl::string ProgramName, char** const envp, const PortableInformation& PortableInfo, bool SecureExecution) {
   const bool IsPortable = PortableInfo.IsPortable;
   FEX::Config::InitializeConfigs(PortableInfo);
   FEXCore::Config::Initialize();
+  if (SecureExecution) {
+    // Credentials the caller did not have: only the system's configuration and directories. A user's
+    // configs, the environment's directories and FEX_* variables would otherwise choose the RootFS and
+    // libraries that run with them.
+    for (bool Global : {false, true}) {
+      FEXCore::Config::SetDataDirectory(GLOBAL_DATA_DIRECTORY, Global);
+      FEXCore::Config::SetConfigDirectory(GLOBAL_DATA_DIRECTORY, Global);
+      FEXCore::Config::SetConfigFileLocation(GLOBAL_DATA_DIRECTORY "Config.json", Global);
+    }
+    if (!IsPortable) {
+      FEXCore::Config::AddLayer(CreateGlobalMainLayer());
+      if (!ProgramName.empty()) {
+        FEXCore::Config::AddLayer(CreateAppLayer(ProgramName, FEXCore::Config::LayerType::LAYER_GLOBAL_APP));
+      }
+    }
+    FEXCore::Config::Load();
+    return;
+  }
+
   if (!IsPortable) {
     FEXCore::Config::AddLayer(CreateGlobalMainLayer());
   }

@@ -390,9 +390,15 @@ int main(int argc, char** argv, char** const envp) {
   const auto PortableInfo = FEX::ReadPortabilityInformation();
   const bool InterpreterInstalled = QueryInterpreterInstalled(ExecutedWithFD, PortableInfo);
 
+  // Started with credentials the caller did not have, FEX runs only the program the kernel handed it,
+  // never one the caller names through FEX_EXECVEFD, and reads only the system's configuration.
+  const bool SecureExecution = FEX::Config::IsSecureExecution();
   int FEXFD {StealFEXFDFromEnv("FEX_EXECVEFD")};
+  if (SecureExecution) {
+    FEXFD = -1;
+  }
   int FEXSeccompFD {StealFEXFDFromEnv("FEX_SECCOMPFD")};
-  const bool FEXFDPathBacked = getenv("FEX_EXECVEFD_PATH") != nullptr;
+  const bool FEXFDPathBacked = !SecureExecution && getenv("FEX_EXECVEFD_PATH") != nullptr;
   unsetenv("FEX_EXECVEFD_PATH");
 
   // Early init trivial handlers.
@@ -410,7 +416,7 @@ int main(int argc, char** argv, char** const envp) {
 
   FEX::Kernel::GCS::CheckForGCS();
 
-  FEX::Config::LoadConfig(Program.ProgramName, envp, PortableInfo);
+  FEX::Config::LoadConfig(Program.ProgramName, envp, PortableInfo, SecureExecution);
 
   // Reload the meta layer
   FEXCore::Config::ReloadMetaLayer();
