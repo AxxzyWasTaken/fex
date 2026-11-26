@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 #include "Common/Config.h"
 #include "Common/FEXServerClient.h"
+#include "Common/InheritedFDs.h"
 
 #include <FEXCore/Config/Config.h>
 #include <FEXCore/fextl/fmt.h>
@@ -356,6 +357,43 @@ TEST_CASE("SecureExecution - no code caches or telemetry") {
   CHECK_FALSE(Secure.CodeCaching);
   CHECK_FALSE(Secure.DiskCache);
   CHECK(Secure.DisableTelemetry);
+}
+
+TEST_CASE("SecureExecution - no fds from the environment") {
+  auto SetAll = [] {
+    setenv("FEX_EXECVEFD", "5", 1);
+    setenv("FEX_EXECVEFD_PATH", "1", 1);
+    setenv("FEX_SECCOMPFD", "6", 1);
+  };
+  auto NoneLeft = [] {
+    return !getenv("FEX_EXECVEFD") && !getenv("FEX_EXECVEFD_PATH") && !getenv("FEX_SECCOMPFD");
+  };
+
+  // Normally FEX takes the program and the seccomp filters a parent FEX passed.
+  SetAll();
+  const auto Normal = FEX::TakeInheritedFDs(false);
+  CHECK(Normal.ExecveFD == 5);
+  CHECK(Normal.ExecveFDPathBacked);
+  CHECK(Normal.SeccompFD == 6);
+  CHECK_FALSE(Normal.SeccompRefused);
+  CHECK(NoneLeft());
+
+  // With credentials the caller did not have, it uses neither, and seccomp filters refuse the start.
+  SetAll();
+  const auto Secure = FEX::TakeInheritedFDs(true);
+  CHECK(Secure.ExecveFD == -1);
+  CHECK_FALSE(Secure.ExecveFDPathBacked);
+  CHECK(Secure.SeccompFD == -1);
+  CHECK(Secure.SeccompRefused);
+  CHECK(NoneLeft());
+
+  // Without FEX_SECCOMPFD it starts, still ignoring FEX_EXECVEFD.
+  setenv("FEX_EXECVEFD", "5", 1);
+  const auto SecureWithoutSeccomp = FEX::TakeInheritedFDs(true);
+  CHECK(SecureWithoutSeccomp.ExecveFD == -1);
+  CHECK(SecureWithoutSeccomp.SeccompFD == -1);
+  CHECK_FALSE(SecureWithoutSeccomp.SeccompRefused);
+  CHECK(NoneLeft());
 }
 
 TEST_CASE("SecureExecution - not for a process with its own credentials") {

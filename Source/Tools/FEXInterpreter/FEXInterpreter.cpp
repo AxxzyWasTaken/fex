@@ -10,6 +10,7 @@ $end_info$
 #include "Common/FEXServerClient.h"
 #include "Common/Config.h"
 #include "Common/HostFeatures.h"
+#include "Common/InheritedFDs.h"
 #include "Common/Linux/LinuxVersion.h"
 #include "Common/Linux/SBRKAllocations.h"
 #include "PortabilityInfo.h"
@@ -364,24 +365,6 @@ void Init(bool Is64Bit, FEXCore::Context::Context* CTX) {
 
 } // namespace FEX::Kernel
 
-/**
- * @brief Get an FD from an environment variable and then unset the environment variable.
- *
- * @param Env The environment variable to extract the FD from.
- *
- * @return -1 if the variable didn't exist.
- */
-static int StealFEXFDFromEnv(const char* Env) {
-  int FEXFD {-1};
-  const char* FEXFDStr = getenv(Env);
-  if (FEXFDStr) {
-    const std::string_view FEXFDView {FEXFDStr};
-    std::from_chars(FEXFDView.data(), FEXFDView.data() + FEXFDView.size(), FEXFD, 10);
-    unsetenv(Env);
-  }
-  return FEXFD;
-}
-
 int main(int argc, char** argv, char** const envp) {
   auto SBRKPointer = FEX::SBRKAllocations::DisableSBRKAllocations();
   FEXCore::Allocator::GLIBCScopedFault GLIBFaultScope;
@@ -391,19 +374,22 @@ int main(int argc, char** argv, char** const envp) {
   const bool InterpreterInstalled = QueryInterpreterInstalled(ExecutedWithFD, PortableInfo);
 
   // Started with credentials the caller did not have, FEX runs only the program the kernel handed it,
-  // never one the caller names through FEX_EXECVEFD, and reads only the system's configuration.
+  // never one the caller names through FEX_EXECVEFD, takes no seccomp filters from FEX_SECCOMPFD, and
+  // reads only the system's configuration.
   const bool SecureExecution = FEX::Config::IsSecureExecution();
-  int FEXFD {StealFEXFDFromEnv("FEX_EXECVEFD")};
-  if (SecureExecution) {
-    FEXFD = -1;
-  }
-  int FEXSeccompFD {StealFEXFDFromEnv("FEX_SECCOMPFD")};
-  const bool FEXFDPathBacked = !SecureExecution && getenv("FEX_EXECVEFD_PATH") != nullptr;
-  unsetenv("FEX_EXECVEFD_PATH");
+  const auto Inherited = FEX::TakeInheritedFDs(SecureExecution);
+  int FEXFD {Inherited.ExecveFD};
+  int FEXSeccompFD {Inherited.SeccompFD};
+  const bool FEXFDPathBacked = Inherited.ExecveFDPathBacked;
 
   // Early init trivial handlers.
   LogMan::Throw::InstallHandler(FEX::Logging::AssertHandler);
   LogMan::Msg::InstallHandler(FEX::Logging::MsgHandler);
+
+  if (Inherited.SeccompRefused) {
+    LogMan::Msg::EFmt("FEX_SECCOMPFD is not accepted with elevated credentials, not starting");
+    return 1;
+  }
 
   auto ArgsLoader = fextl::make_unique<FEX::ArgLoader::ArgLoader>(argc, argv);
   auto Args = ArgsLoader->Get();
