@@ -297,9 +297,8 @@ DEF_OP(CondJump) {
 }
 
 DEF_OP(Syscall) {
-  SpillStaticRegs(TMP1);
-
-  // Not coming back.
+  // Not coming back. Static registers are spilled inside ThreadDispatchSyscallHandler so the
+  // direct-passthrough syscall fast path can avoid spilling FPRs and serializing FPCR.
   ResetStack();
 
   // Jump to the syscall dispatch handler. We won't return after this.

@@ -348,8 +348,9 @@ void SignalDelegator::RestoreThreadState(FEXCore::Core::InternalThreadState* Thr
       const uint32_t ChangedEFLAGS = Context->OriginalEFLAGS ^ CTX->ReconstructCompactedEFLAGS(Thread, false, nullptr, 0);
       FillSRA(Thread, ucontext, Context->InSyscallInfo & 0xFFFF, ChangedEFLAGS);
     } else if (Context->Flags & ArchHelpers::Context::ContextFlags::CONTEXT_FLAG_FPR_IN_UCONTEXT) {
-      // The interrupted NoFP leaf thunk resumes without reloading static FPRs from the frame,
-      // so propagate any guest handler XMM modifications back into ucontext's static FPRs.
+      // The interrupted NoFP leaf thunk or fast syscall resumes without reloading static FPRs from
+      // the frame (and without touching syscall argument/return GPRs in ucontext), so propagate any
+      // guest handler XMM modifications back into ucontext's static FPRs.
       FillSRAFPRs(Thread, ucontext);
     }
   }
@@ -416,6 +417,10 @@ bool SignalDelegator::HandleDispatcherGuestSignal(FEXCore::Core::InternalThreadS
     }
   } else if (IsAddressInDispatcher(OldPC) && !InThunkCall) {
     if (FprsUnspilled) {
+      // Interrupted in the dispatcher's NoFP direct-passthrough syscall path (pre-svc check or svc #0):
+      // all static GPRs, NZCV, PF/AF, and guest RIP are already in Frame->State, while static FPRs
+      // (v16..v31) remain live in ucontext. Spill FPRs to Frame->State and do NOT set
+      // CONTEXT_FLAG_INDISPATCHER (which would overwrite syscall GPRs on sigreturn).
       SpillSRAFPRs(Thread, ucontext);
       ContextBackup->Flags |= ArchHelpers::Context::ContextFlags::CONTEXT_FLAG_FPR_IN_UCONTEXT;
     } else {

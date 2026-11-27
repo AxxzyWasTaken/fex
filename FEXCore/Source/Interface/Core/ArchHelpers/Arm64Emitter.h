@@ -144,7 +144,7 @@ protected:
     bool SetPredRegs {};
 
     // Whether or not to update FPCR AFP bits (NEP/AH/FIZ). Can be disabled when the callee
-    // executes no FP/SIMD instructions and leaves FPCR intact.
+    // or kernel syscall executes no FP/SIMD instructions and leaves FPCR intact.
     bool SetAFP {true};
   };
   void FillSpecialRegs(ARMEmitter::Register TmpReg, ARMEmitter::Register TmpReg2, const FillSpecialRegsOptions& Options);

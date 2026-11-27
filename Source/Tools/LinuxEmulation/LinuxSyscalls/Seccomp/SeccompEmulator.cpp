@@ -164,6 +164,9 @@ void SeccompEmulator::InheritSeccompFilters(FEX::HLE::ThreadStateObject* Parent,
 
   // Copy the operating mode.
   Child->SeccompMode = Parent->SeccompMode;
+  if (Child->Thread && Child->Thread->CurrentFrame) {
+    std::atomic_ref<uint32_t>(Child->Thread->CurrentFrame->HasSeccompFilter).store(Child->Filters.empty() ? 0U : 1U, std::memory_order_release);
+  }
 }
 
 void SeccompEmulator::FreeSeccompFilters(FEX::HLE::ThreadStateObject* Thread) {
@@ -312,6 +315,7 @@ void SeccompEmulator::DeserializeFilters(FEXCore::Core::CpuStateFrame* Frame, in
   }
 
   Thread->SeccompMode = Header.SeccompMode;
+  std::atomic_ref<uint32_t>(Frame->HasSeccompFilter).store(Thread->Filters.empty() ? 0U : 1U, std::memory_order_release);
   close(FD);
 }
 
@@ -590,6 +594,9 @@ void SeccompEmulator::TSyncFilters(FEXCore::Core::CpuStateFrame* Frame) {
       std::atomic_ref<uint64_t>(Filter->RefCount)++;
     }
     Thread->SeccompMode = ParentThread->SeccompMode;
+    if (Thread->Thread && Thread->Thread->CurrentFrame) {
+      std::atomic_ref<uint32_t>(Thread->Thread->CurrentFrame->HasSeccompFilter).store(Thread->Filters.empty() ? 0U : 1U, std::memory_order_release);
+    }
   }
 }
 
@@ -671,6 +678,7 @@ uint64_t SeccompEmulator::SetModeFilter(FEXCore::Core::CpuStateFrame* Frame, uin
     // Append the filter to the thread.
     Thread->Filters.emplace_back(&it);
     Thread->SeccompMode = SECCOMP_MODE_FILTER;
+    std::atomic_ref<uint32_t>(Frame->HasSeccompFilter).store(1U, std::memory_order_release);
     if (flags & SECCOMP_FILTER_FLAG_TSYNC) {
       TSyncFilters(Frame);
     }

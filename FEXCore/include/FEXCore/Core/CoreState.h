@@ -480,6 +480,9 @@ struct CpuStateFrame {
   } SynchronousFaultData;
 
   uint32_t SignalHandlerRefCounter {};
+  // Non-zero when this thread has one or more emulated seccomp filters installed.
+  // Checked by the dispatcher's direct-passthrough syscall fast path.
+  uint32_t HasSeccompFilter {};
 
   InternalThreadState* Thread;
 
