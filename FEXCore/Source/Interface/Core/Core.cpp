@@ -218,10 +218,12 @@ uint32_t ContextImpl::ReconstructCompactedEFLAGS(FEXCore::Core::InternalThreadSt
     // Packed in to the same bit locations as RFLAG_NZCV_LOC.
     Packed_NZCV = PSTATE;
 
-    // If we were in the JIT then PF and AF are in registers.
-    // Move them to the CPUState frame now.
-    Frame->State.pf_raw = HostGPRs[CPU::REG_PF.Idx()];
-    Frame->State.af_raw = HostGPRs[CPU::REG_AF.Idx()];
+    if (!HostFeatures.SupportsAPFLG) {
+      // If we were in the JIT then PF and AF are in registers.
+      // Move them to the CPUState frame now.
+      Frame->State.pf_raw = HostGPRs[CPU::REG_PF.Idx()];
+      Frame->State.af_raw = HostGPRs[CPU::REG_AF.Idx()];
+    }
   } else {
     // If we were not in the JIT then the NZCV state is stored in the CPUState RFLAG_NZCV_LOC.
     // SF/ZF/CF/OF are packed in a 32-bit value in RFLAG_NZCV_LOC.
