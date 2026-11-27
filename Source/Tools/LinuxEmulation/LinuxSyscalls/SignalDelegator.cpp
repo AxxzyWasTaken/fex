@@ -99,19 +99,8 @@ void SignalDelegator::RegisterHostSignalHandler(int Signal, HostSignalDelegatorF
   FrontendRegisterHostSignalHandler(Signal, Required);
 }
 
-void SignalDelegator::SpillSRA(FEXCore::Core::InternalThreadState* Thread, void* ucontext, uint32_t IgnoreMask) {
+void SignalDelegator::SpillSRAFPRs(FEXCore::Core::InternalThreadState* Thread, void* ucontext) {
 #ifdef ARCHITECTURE_arm64
-  Thread->CurrentFrame->State.rip = CTX->RestoreRIPFromHostPC(Thread, ArchHelpers::Context::GetPc(ucontext));
-
-  for (size_t i = 0; i < Config.SRAGPRCount; i++) {
-    const uint8_t SRAIdxMap = Config.SRAGPRMapping[i];
-    if (IgnoreMask & (1U << SRAIdxMap)) {
-      // Skip this one, it's already spilled
-      continue;
-    }
-    Thread->CurrentFrame->State.gregs[i] = ArchHelpers::Context::GetArmReg(ucontext, SRAIdxMap);
-  }
-
   if (SupportsAVX && SupportsSVE256) {
     // TODO: This doesn't save the upper 128-bits of the 256-bit registers.
     // This needs to be implemented still.
@@ -125,6 +114,38 @@ void SignalDelegator::SpillSRA(FEXCore::Core::InternalThreadState* Thread, void*
       memcpy(&Thread->CurrentFrame->State.xmm.sse.data[i][0], &FPR, sizeof(__uint128_t));
     }
   }
+#endif
+}
+
+void SignalDelegator::FillSRAFPRs(FEXCore::Core::InternalThreadState* Thread, void* ucontext) {
+#ifdef ARCHITECTURE_arm64
+  const auto& State = Thread->CurrentFrame->State;
+  // A 32-bit guest frame only has the first eight registers, the frame's copy of the rest predates the spill.
+  const size_t GuestRegs = Is64BitMode ? 16 : 8;
+
+  // Like SpillSRAFPRs, this leaves the upper 128-bits of 256-bit registers alone.
+  auto* FPRs = ArchHelpers::Context::GetArmFPRs(ucontext);
+  for (size_t i = 0; i < std::min<size_t>(Config.SRAFPRCount, GuestRegs); i++) {
+    const void* XMM = SupportsAVX && SupportsSVE256 ? &State.xmm.avx.data[i][0] : &State.xmm.sse.data[i][0];
+    memcpy(&FPRs[Config.SRAFPRMapping[i]], XMM, sizeof(__uint128_t));
+  }
+#endif
+}
+
+void SignalDelegator::SpillSRA(FEXCore::Core::InternalThreadState* Thread, void* ucontext, uint32_t IgnoreMask) {
+#ifdef ARCHITECTURE_arm64
+  Thread->CurrentFrame->State.rip = CTX->RestoreRIPFromHostPC(Thread, ArchHelpers::Context::GetPc(ucontext));
+
+  for (size_t i = 0; i < Config.SRAGPRCount; i++) {
+    const uint8_t SRAIdxMap = Config.SRAGPRMapping[i];
+    if (IgnoreMask & (1U << SRAIdxMap)) {
+      // Skip this one, it's already spilled
+      continue;
+    }
+    Thread->CurrentFrame->State.gregs[i] = ArchHelpers::Context::GetArmReg(ucontext, SRAIdxMap);
+  }
+
+  SpillSRAFPRs(Thread, ucontext);
 
   uint32_t EFlags =
     CTX->ReconstructCompactedEFLAGS(Thread, true, ArchHelpers::Context::GetArmGPRs(ucontext), ArchHelpers::Context::GetArmPState(ucontext));
@@ -148,12 +169,7 @@ void SignalDelegator::FillSRA(FEXCore::Core::InternalThreadState* Thread, void* 
     ArchHelpers::Context::SetArmReg(ucontext, SRAIdxMap, State.gregs[i]);
   }
 
-  // Like SpillSRA, this leaves the upper 128-bits of 256-bit registers alone.
-  auto* FPRs = ArchHelpers::Context::GetArmFPRs(ucontext);
-  for (size_t i = 0; i < std::min<size_t>(Config.SRAFPRCount, GuestRegs); i++) {
-    const void* XMM = SupportsAVX && SupportsSVE256 ? &State.xmm.avx.data[i][0] : &State.xmm.sse.data[i][0];
-    memcpy(&FPRs[Config.SRAFPRMapping[i]], XMM, sizeof(__uint128_t));
-  }
+  FillSRAFPRs(Thread, ucontext);
 
   ArchHelpers::Context::SetArmPState(
     ucontext, CTX->FlipHostEFLAGS(ChangedEFLAGS, ArchHelpers::Context::GetArmGPRs(ucontext), ArchHelpers::Context::GetArmPState(ucontext)));
@@ -331,6 +347,10 @@ void SignalDelegator::RestoreThreadState(FEXCore::Core::InternalThreadState* Thr
       // Flags only get the handler's changes: the JIT may hold them in a different form at this point.
       const uint32_t ChangedEFLAGS = Context->OriginalEFLAGS ^ CTX->ReconstructCompactedEFLAGS(Thread, false, nullptr, 0);
       FillSRA(Thread, ucontext, Context->InSyscallInfo & 0xFFFF, ChangedEFLAGS);
+    } else if (Context->Flags & ArchHelpers::Context::ContextFlags::CONTEXT_FLAG_FPR_IN_UCONTEXT) {
+      // The interrupted NoFP leaf thunk resumes without reloading static FPRs from the frame,
+      // so propagate any guest handler XMM modifications back into ucontext's static FPRs.
+      FillSRAFPRs(Thread, ucontext);
     }
   }
 
@@ -366,6 +386,7 @@ bool SignalDelegator::HandleDispatcherGuestSignal(FEXCore::Core::InternalThreadS
   // (notably x8 = guest RSP, which host thunks clobber with Linux syscall numbers). The frame holds the
   // authoritative guest state, so neither spill nor refill SRA here.
   const bool InThunkCall = (Frame->InSyscallInfo & FEXCore::Core::CpuStateFrame::IN_THUNK_CALL) != 0;
+  const bool FprsUnspilled = (Frame->InSyscallInfo & FEXCore::Core::CpuStateFrame::SRA_FPR_UNSPILLED) != 0;
 
   if (WasInJIT && !InThunkCall) {
     uint32_t IgnoreMask {};
@@ -387,11 +408,31 @@ bool SignalDelegator::HandleDispatcherGuestSignal(FEXCore::Core::InternalThreadS
 
     ContextBackup->Flags |= ArchHelpers::Context::ContextFlags::CONTEXT_FLAG_INJIT;
   } else if (WasInJIT && InThunkCall) {
-    // Reconstruct the thunk instruction RIP without touching the already-spilled static registers.
+    // Reconstruct the thunk instruction RIP without touching the already-spilled static GPRs.
     Frame->State.rip = CTX->RestoreRIPFromHostPC(Thread, OldPC);
+    if (FprsUnspilled) {
+      SpillSRAFPRs(Thread, ucontext);
+      ContextBackup->Flags |= ArchHelpers::Context::ContextFlags::CONTEXT_FLAG_FPR_IN_UCONTEXT;
+    }
   } else if (IsAddressInDispatcher(OldPC) && !InThunkCall) {
-    // Signals only arrive at points where the dispatcher holds the guest state in both the frame and the static registers.
-    ContextBackup->Flags |= ArchHelpers::Context::ContextFlags::CONTEXT_FLAG_INDISPATCHER;
+    if (FprsUnspilled) {
+      SpillSRAFPRs(Thread, ucontext);
+      ContextBackup->Flags |= ArchHelpers::Context::ContextFlags::CONTEXT_FLAG_FPR_IN_UCONTEXT;
+    } else {
+      // Signals only arrive at points where the dispatcher holds the guest state in both the frame and the static registers.
+      ContextBackup->Flags |= ArchHelpers::Context::ContextFlags::CONTEXT_FLAG_INDISPATCHER;
+    }
+  } else if (FprsUnspilled) {
+    // Interrupted inside a NoFP leaf thunk (e.g., host kernel vDSO): static GPRs are already in Frame->State,
+    // while static FPRs (v16..v31) remain live in ucontext. Spill FPRs into Frame->State and reconstruct guest RIP
+    // from the active thunk JIT block header (NoFP leaf thunks never make re-entrant guest callbacks).
+    SpillSRAFPRs(Thread, ucontext);
+    if (InThunkCall) {
+      if (const uint64_t BlockEntry = CTX->GetGuestBlockEntry(Thread); BlockEntry != 0) {
+        Frame->State.rip = BlockEntry;
+      }
+    }
+    ContextBackup->Flags |= ArchHelpers::Context::ContextFlags::CONTEXT_FLAG_FPR_IN_UCONTEXT;
   }
 
   // The guest handler isn't in a syscall, even when the signal arrived in the syscall handler. StoreThreadState saved the
@@ -526,14 +567,24 @@ bool SignalDelegator::HandleSignalPause(FEXCore::Core::InternalThreadState* Thre
     StoreThreadState(Thread, Signal, ucontext, false);
 
     const bool InThunkCall = (Frame->InSyscallInfo & FEXCore::Core::CpuStateFrame::IN_THUNK_CALL) != 0;
+    const bool FprsUnspilled = (Frame->InSyscallInfo & FEXCore::Core::CpuStateFrame::SRA_FPR_UNSPILLED) != 0;
     if (CTX->IsAddressInCodeBuffer(Thread, ArchHelpers::Context::GetPc(ucontext)) && !InThunkCall) {
       // We are in jit, SRA must be spilled
       ArchHelpers::Context::SetPc(ucontext, Config.ThreadPauseHandlerAddressSpillSRA);
     } else {
-      // We are in non-jit, SRA is already spilled
+      // We are in non-jit, SRA GPRs are already spilled; sync live FPRs and clear AFP if unspilled.
+      // StoreThreadState already saved the original FPCR in ContextBackup so resume restores it.
+      if (FprsUnspilled) {
+        SpillSRAFPRs(Thread, ucontext);
+#ifdef ARCHITECTURE_arm64
+        ArchHelpers::Context::ClearArmAFP(ucontext);
+#endif
+      }
 #if defined(ASSERTIONS_ENABLED) && ASSERTIONS_ENABLED
-      LOGMAN_THROW_A_FMT(!IsAddressInDispatcher(ArchHelpers::Context::GetPc(ucontext)) || InThunkCall, "Signals in dispatcher have "
-                                                                                                       "unsynchronized context");
+      LOGMAN_THROW_A_FMT(!IsAddressInDispatcher(ArchHelpers::Context::GetPc(ucontext)) || InThunkCall || FprsUnspilled, "Signals in "
+                                                                                                                        "dispatcher have "
+                                                                                                                        "unsynchronized "
+                                                                                                                        "context");
 #endif
       ArchHelpers::Context::SetPc(ucontext, Config.ThreadPauseHandlerAddress);
     }
@@ -560,14 +611,22 @@ bool SignalDelegator::HandleSignalPause(FEXCore::Core::InternalThreadState* Thre
 
     // Set the new PC
     const bool InThunkCall = (Frame->InSyscallInfo & FEXCore::Core::CpuStateFrame::IN_THUNK_CALL) != 0;
+    const bool FprsUnspilled = (Frame->InSyscallInfo & FEXCore::Core::CpuStateFrame::SRA_FPR_UNSPILLED) != 0;
     if (CTX->IsAddressInCodeBuffer(Thread, ArchHelpers::Context::GetPc(ucontext)) && !InThunkCall) {
       // We are in jit, SRA must be spilled
       ArchHelpers::Context::SetPc(ucontext, Config.ThreadStopHandlerAddressSpillSRA);
     } else {
-      // We are in non-jit, SRA is already spilled
+      // We are in non-jit, SRA is already spilled; clear AFP before returning to host C++.
+      if (FprsUnspilled) {
+#ifdef ARCHITECTURE_arm64
+        ArchHelpers::Context::ClearArmAFP(ucontext);
+#endif
+      }
 #if defined(ASSERTIONS_ENABLED) && ASSERTIONS_ENABLED
-      LOGMAN_THROW_A_FMT(!IsAddressInDispatcher(ArchHelpers::Context::GetPc(ucontext)) || InThunkCall, "Signals in dispatcher have "
-                                                                                                       "unsynchronized context");
+      LOGMAN_THROW_A_FMT(!IsAddressInDispatcher(ArchHelpers::Context::GetPc(ucontext)) || InThunkCall || FprsUnspilled, "Signals in "
+                                                                                                                        "dispatcher have "
+                                                                                                                        "unsynchronized "
+                                                                                                                        "context");
 #endif
       ArchHelpers::Context::SetPc(ucontext, Config.ThreadStopHandlerAddress);
     }

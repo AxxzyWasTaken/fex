@@ -151,6 +151,8 @@ public:
 
   void SpillSRA(FEXCore::Core::InternalThreadState* Thread, void* ucontext, uint32_t IgnoreMask);
   void FillSRA(FEXCore::Core::InternalThreadState* Thread, void* ucontext, uint32_t IgnoreMask, uint32_t ChangedEFLAGS);
+  void SpillSRAFPRs(FEXCore::Core::InternalThreadState* Thread, void* ucontext);
+  void FillSRAFPRs(FEXCore::Core::InternalThreadState* Thread, void* ucontext);
 
 private:
   enum DefaultBehaviourType {

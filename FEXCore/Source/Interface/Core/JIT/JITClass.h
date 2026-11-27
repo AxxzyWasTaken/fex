@@ -650,6 +650,8 @@ private:
   void EmitPendingInterruptFaultCheck();
   void EmitSuspendInterruptCheck();
 
+  [[nodiscard]] bool HasLiveCallerSavedDynamicRegsAfter(IR::Ref Node) const;
+
   void EmitEntryPoint(ARMEmitter::BackwardLabel& HeaderLabel, bool CheckTF);
 
   [[nodiscard]] CodeBuffer::CodeBufferAllocation AllocateCodeBufferInSharedCache(size_t Size);

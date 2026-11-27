@@ -658,7 +658,7 @@ void Arm64Emitter::PopCalleeSavedRegisters() {
 
 void Arm64Emitter::FillSpecialRegs(ARMEmitter::Register TmpReg, ARMEmitter::Register TmpReg2, const FillSpecialRegsOptions& Options) {
 #ifndef VIXL_SIMULATOR
-  if (EmitterCTX->HostFeatures.SupportsAFP) {
+  if (Options.SetAFP && EmitterCTX->HostFeatures.SupportsAFP) {
     // Enable AFP features when filling JIT state.
     mrs(TmpReg, ARMEmitter::SystemRegister::FPCR);
 
@@ -702,7 +702,7 @@ void Arm64Emitter::FillSpecialRegs(ARMEmitter::Register TmpReg, ARMEmitter::Regi
 
 void Arm64Emitter::SpillStaticRegs(ARMEmitter::Register TmpReg, SpillStaticRegOptions Options) {
 #ifndef VIXL_SIMULATOR
-  if (EmitterCTX->HostFeatures.SupportsAFP) {
+  if (Options.FPCR && EmitterCTX->HostFeatures.SupportsAFP) {
     // Disable AFP features when spilling registers.
     //
     // Disable FPCR.NEP and FPCR.AH and FPCR.FIZ
@@ -857,7 +857,7 @@ void Arm64Emitter::FillStaticRegs(FillStaticRegOptions Options) {
     msr(ARMEmitter::SystemRegister::NZCV, TmpReg);
   }
 
-  FillSpecialRegs(TmpReg, TmpReg2, {.SetFIZ = true, .SetPredRegs = Options.FPRs});
+  FillSpecialRegs(TmpReg, TmpReg2, {.SetFIZ = true, .SetPredRegs = Options.FPRs, .SetAFP = Options.FPCR});
 
   if (Options.FPRs) {
     if (EmitterCTX->HostFeatures.SupportsAVX() && EmitterCTX->HostFeatures.SupportsSVE256()) {

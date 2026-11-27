@@ -460,11 +460,13 @@ struct CpuStateFrame {
    *
    * Nonzero while in a syscall or a host call, where signals are taken right away.
    * ARM64:
+   *  - Bit 17: Static FPRs (v16..v31) remain live in hardware registers / ucontext (SRA_FPR_UNSPILLED)
    *  - Bit 16: In a thunk call (IN_THUNK_CALL)
    *  - Bit 15-0: Mask of the static registers already spilled, by host register index
    */
   uint64_t InSyscallInfo {};
   static constexpr uint64_t IN_THUNK_CALL = 1ULL << 16;
+  static constexpr uint64_t SRA_FPR_UNSPILLED = 1ULL << 17;
 
   struct SynchronousFaultDataStruct {
     bool FaultToTopAndGeneratedException {};
