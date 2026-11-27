@@ -263,80 +263,114 @@ public:
     return HostPtr;
   }
 
-  void UpdateDynamicL1Stats(FEXCore::Core::InternalThreadState* Thread, uint64_t GuestAddress, uint64_t HostCode) {
-    // If host pointer was found in L2 or L3, then add it to the counter.
-    // Keeping track not L1 misses, but specifically L2/L3 hits.
-    ++L2L3CacheHits;
-
-    // Only check the clock every SAMPLE_CHECK_STRIDE hits to keep L2/L3 lookups cheap.
-    if ((L2L3CacheHits & (SAMPLE_CHECK_STRIDE - 1)) != 0) {
-      return;
-    }
-
-    double AveragePerSecond {};
-#ifdef ARCHITECTURE_arm64
-    const uint64_t Freq = FEXCore::Utils::SpinWaitLock::CycleCounterFrequency;
-    if (Freq == 0) [[unlikely]] {
-      return;
-    }
-
-    const uint64_t CurrentTicks = ReadSampleCounter();
-    const uint64_t ElapsedTicks = CurrentTicks - LastPeriodTicks;
-    const uint64_t SamplePeriodTicks = Freq * SamplePeriodSeconds;
-    if (ElapsedTicks < SamplePeriodTicks) {
-      return;
-    }
-
-    // Scale in double to avoid 64-bit integer overflow in L2L3CacheHits * Freq.
-    // ElapsedTicks >= SamplePeriodTicks >= Freq > 0 guarantees a positive divisor.
-    AveragePerSecond = (static_cast<double>(L2L3CacheHits) * static_cast<double>(Freq)) / static_cast<double>(ElapsedTicks);
-    LastPeriodTicks = CurrentTicks;
-#else
-    const auto CurrentTime = std::chrono::steady_clock::now();
-    const auto Period = CurrentTime - LastPeriod;
-    if (Period < SamplePeriod) {
-      return;
-    }
-
-    const auto ElapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(Period).count();
-    AveragePerSecond = static_cast<double>(L2L3CacheHits) / static_cast<double>(ElapsedMs) * 1000.0;
-    LastPeriod = CurrentTime;
+  // Fast, non-blocking, zero-allocation L1/L2/L3 lookup for NoFP/NoSIMD dispatcher paths.
+  // Returns 0 whenever slow-path handling is required (lock contention, cache miss, first-time
+  // CachedCodePages/L2-page allocation, or DynamicL1Cache 1-second resize tick).
+  // Marked always_inline + flatten so template helpers (e.g. BlockList.find) cannot resolve
+  // via COMDAT/LTO to a +fp,+neon instantiation from another translation unit.
+#if defined(__clang__) || defined(__GNUC__)
+  __attribute__((always_inline, flatten))
 #endif
+  uintptr_t TryFindBlockNoFP(FEXCore::Core::InternalThreadState* Thread, uint64_t Address) {
+    // Try 2-way L1, no lock needed (rare here since NoBlock is entered after an L1 miss).
+    auto& L1Bucket = reinterpret_cast<L1Set*>(L1Pointer)[HashL1Index(Address) & L1PointerMask];
+    if (L1Bucket.Ways[0].GuestCode == Address) [[unlikely]] {
+      return L1Bucket.Ways[0].HostCode;
+    }
+    if (L1Bucket.Ways[1].GuestCode == Address) [[unlikely]] {
+      return L1Bucket.Ways[1].HostCode;
+    }
 
-    // If larger than the sample period then check if we need to increase L1 cache size.
-    if (AveragePerSecond >= DynamicL1CacheIncreaseCountHeuristic()) {
-      if (CurrentL1Entries < MAX_L1_ENTRIES) {
-        // Entries whose address has the new mask bit set would be unreachable by InvalidateCache
-        FEXCore::Allocator::VirtualDontNeed(reinterpret_cast<void*>(L1Pointer), CurrentL1Entries * sizeof(LookupCacheEntry), false);
+    if (!Shared->Lock.TryLockSharedNoFP()) [[unlikely]] {
+      return 0;
+    }
 
-        CurrentL1Entries <<= 1;
-        L1PointerMask = (CurrentL1Entries / L1_WAYS) - 1;
+    uintptr_t HostPtr {};
+    bool FromL3 = false;
+    const bool L2Enabled = !DisableL2Cache();
+    LookupCacheEntry* L2Slot = nullptr;
 
-        // Update the thread's L1 pointer mask to increase how much cache it uses.
-        // Since we're in C-code, this is safe to update here.
-        Thread->CurrentFrame->State.L1Mask = GetScaledL1PointerMask();
-
-        // If L1 was just grown and cleared, re-insert our cached entry.
-        AddL1Entry(GuestAddress, HostCode);
-      }
-    } else if (AveragePerSecond < DynamicL1CacheDecreaseCountHeuristic()) {
-      if (CurrentL1Entries > MIN_L1_ENTRIES) {
-        CurrentL1Entries >>= 1;
-        L1PointerMask = (CurrentL1Entries / L1_WAYS) - 1;
-
-        // Madvise the entries that we are dropping. Gives the memory back to the OS.
-        LookupCacheEntry* FirstZeroL1Entry = &reinterpret_cast<LookupCacheEntry*>(L1Pointer)[CurrentL1Entries];
-        size_t ZeroMemorySize = (MAX_L1_ENTRIES - CurrentL1Entries) * sizeof(LookupCacheEntry);
-        FEXCore::Allocator::VirtualDontNeed(FirstZeroL1Entry, ZeroMemorySize, false);
-
-        // Update the thread's L1 pointer mask to decrease how much cache it uses.
-        // Since we're in C-code, this is safe to update here.
-        Thread->CurrentFrame->State.L1Mask = GetScaledL1PointerMask();
+    if (L2Enabled) [[unlikely]] {
+      const auto PageIndex = (Address & (VirtualMemSize - 1)) >> 12;
+      const auto PageOffset = Address & 0x0FFFU;
+      const auto Pointers = reinterpret_cast<uintptr_t*>(PagePointer);
+      const auto LocalPagePointer = Pointers[PageIndex];
+      if (LocalPagePointer) {
+        auto* BlockPointers = reinterpret_cast<LookupCacheEntry*>(LocalPagePointer);
+        L2Slot = &BlockPointers[PageOffset];
+        if (L2Slot->GuestCode == Address) {
+          HostPtr = L2Slot->HostCode;
+        }
       }
     }
 
-    L2L3CacheHits = 0;
+    if (!HostPtr) [[likely]] {
+      // Try L3 (shared GuestToHostMap::BlockList)
+      auto It = Shared->BlockList.find(Address);
+      if (It == Shared->BlockList.end()) {
+        Shared->Lock.UnlockSharedNoFP();
+        return 0;
+      }
+
+      const auto& Entry = It->second;
+      // Require an existing L2 page backing when L2 is enabled; otherwise fall back once
+      // so CacheBlockMapping can allocate or clear L2 cleanly.
+      if (!Entry.HostCode || (L2Enabled && !L2Slot)) {
+        Shared->Lock.UnlockSharedNoFP();
+        return 0;
+      }
+
+      // Require every guest code page of this block to already be tracked in this thread's
+      // CachedCodePages so this path performs zero heap allocations. First-time blocks fall
+      // back once to CompileBlock -> FindBlock -> CacheBlockMapping.
+      for (const auto CodePage : Entry.CodePages) {
+        auto PageIt = CachedCodePages.find(CodePage >> 12);
+        if (PageIt == CachedCodePages.end() || !PageIt->second.contains(Address)) {
+          Shared->Lock.UnlockSharedNoFP();
+          return 0;
+        }
+      }
+
+      HostPtr = Entry.HostCode;
+      FromL3 = true;
+    }
+
+    // Check the 1-second DynamicL1Cache resize tick BEFORE mutating L1/L2/L2L3CacheHits so
+    // the full FP heuristic and VirtualDontNeed resize run once per second via CompileBlock.
+    const bool TrackDynamicL1 = DynamicL1Cache();
+    uint64_t NextHits = 0;
+    if (TrackDynamicL1) {
+      NextHits = L2L3CacheHits + 1;
+      if ((NextHits & (SAMPLE_CHECK_STRIDE - 1)) == 0) {
+#ifdef ARCHITECTURE_arm64
+        const uint64_t Freq = FEXCore::Utils::SpinWaitLock::CycleCounterFrequency;
+        if (Freq != 0 && (ReadSampleCounter() - LastPeriodTicks) >= (Freq * SamplePeriodSeconds)) {
+          Shared->Lock.UnlockSharedNoFP();
+          return 0;
+        }
+#else
+        Shared->Lock.UnlockSharedNoFP();
+        return 0;
+#endif
+      }
+    }
+
+    if (FromL3 && L2Slot) {
+      L2Slot->GuestCode = Address;
+      L2Slot->HostCode = HostPtr;
+    }
+
+    AddL1Entry(Address, HostPtr);
+    if (TrackDynamicL1) {
+      L2L3CacheHits = NextHits;
+    }
+    Shared->Lock.UnlockSharedNoFP();
+
+    FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedCacheMissCount, 1);
+    return HostPtr;
   }
+
+  void UpdateDynamicL1Stats(FEXCore::Core::InternalThreadState* Thread, uint64_t GuestAddress, uint64_t HostCode);
 
   GuestToHostMap* Shared = nullptr;
 
