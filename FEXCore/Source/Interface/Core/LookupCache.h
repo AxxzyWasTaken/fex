@@ -3,6 +3,7 @@
 #include "Interface/Context/Context.h"
 #include <FEXCore/Utils/LogManager.h>
 #include <FEXCore/Utils/SHMStats.h>
+#include <FEXCore/Utils/SpinWaitLock.h>
 #include <FEXCore/Utils/WritePriorityMutex.h>
 
 #include <FEXCore/fextl/map.h>
@@ -12,6 +13,7 @@
 #include <FEXCore/fextl/vector.h>
 #include <FEXCore/fextl/memory_resource.h>
 
+#include <chrono>
 #include <cstdint>
 #include <span>
 #include <stddef.h>
@@ -248,48 +250,74 @@ public:
     // Keeping track not L1 misses, but specifically L2/L3 hits.
     ++L2L3CacheHits;
 
-    const auto CurrentTime = std::chrono::system_clock::now();
-    const auto Period = CurrentTime - LastPeriod;
-    if (Period >= SamplePeriod) {
-      // If larger than the sample period then check if we need to increase L1 cache size.
-      const double AveragePerSecond = static_cast<double>(L2L3CacheHits) /
-                                      static_cast<double>(std::chrono::duration_cast<std::chrono::milliseconds>(Period).count()) * 1000.0;
-
-      if (AveragePerSecond >= DynamicL1CacheIncreaseCountHeuristic()) {
-        if (CurrentL1Entries < MAX_L1_ENTRIES) {
-          // Entries whose address has the new mask bit set would be unreachable by InvalidateCache
-          FEXCore::Allocator::VirtualDontNeed(reinterpret_cast<void*>(L1Pointer), CurrentL1Entries * sizeof(LookupCacheEntry), false);
-
-          CurrentL1Entries <<= 1;
-          L1PointerMask = CurrentL1Entries - 1;
-
-          // Update the thread's L1 pointer mask to increase how much cache it uses.
-          // Since we're in C-code, this is safe to update here.
-          Thread->CurrentFrame->State.L1Mask = GetScaledL1PointerMask();
-
-          // If L1 was just shrunk, then we just removed our cached entry. Add it back.
-          AddL1Entry(GuestAddress, HostCode);
-        }
-      } else if (AveragePerSecond < DynamicL1CacheDecreaseCountHeuristic()) {
-        if (CurrentL1Entries > MIN_L1_ENTRIES) {
-          CurrentL1Entries >>= 1;
-          L1PointerMask = CurrentL1Entries - 1;
-
-          // Madvise the entries that we are dropping. Gives the memory back to the OS.
-          LookupCacheEntry* FirstZeroL1Entry = &reinterpret_cast<LookupCacheEntry*>(L1Pointer)[CurrentL1Entries];
-          size_t ZeroMemorySize = (MAX_L1_ENTRIES - CurrentL1Entries) * sizeof(LookupCacheEntry);
-          FEXCore::Allocator::VirtualDontNeed(FirstZeroL1Entry, ZeroMemorySize, false);
-
-          // Update the thread's L1 pointer mask to increase how much cache it uses.
-          // Since we're in C-code, this is safe to update here.
-          Thread->CurrentFrame->State.L1Mask = GetScaledL1PointerMask();
-        }
-      }
-
-      // Update Last period to start again.
-      LastPeriod = CurrentTime;
-      L2L3CacheHits = 0;
+    // Only check the clock every SAMPLE_CHECK_STRIDE hits to keep L2/L3 lookups cheap.
+    if ((L2L3CacheHits & (SAMPLE_CHECK_STRIDE - 1)) != 0) {
+      return;
     }
+
+    double AveragePerSecond {};
+#ifdef ARCHITECTURE_arm64
+    const uint64_t Freq = FEXCore::Utils::SpinWaitLock::CycleCounterFrequency;
+    if (Freq == 0) [[unlikely]] {
+      return;
+    }
+
+    const uint64_t CurrentTicks = ReadSampleCounter();
+    const uint64_t ElapsedTicks = CurrentTicks - LastPeriodTicks;
+    const uint64_t SamplePeriodTicks = Freq * SamplePeriodSeconds;
+    if (ElapsedTicks < SamplePeriodTicks) {
+      return;
+    }
+
+    // Scale in double to avoid 64-bit integer overflow in L2L3CacheHits * Freq.
+    // ElapsedTicks >= SamplePeriodTicks >= Freq > 0 guarantees a positive divisor.
+    AveragePerSecond = (static_cast<double>(L2L3CacheHits) * static_cast<double>(Freq)) / static_cast<double>(ElapsedTicks);
+    LastPeriodTicks = CurrentTicks;
+#else
+    const auto CurrentTime = std::chrono::steady_clock::now();
+    const auto Period = CurrentTime - LastPeriod;
+    if (Period < SamplePeriod) {
+      return;
+    }
+
+    const auto ElapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(Period).count();
+    AveragePerSecond = static_cast<double>(L2L3CacheHits) / static_cast<double>(ElapsedMs) * 1000.0;
+    LastPeriod = CurrentTime;
+#endif
+
+    // If larger than the sample period then check if we need to increase L1 cache size.
+    if (AveragePerSecond >= DynamicL1CacheIncreaseCountHeuristic()) {
+      if (CurrentL1Entries < MAX_L1_ENTRIES) {
+        // Entries whose address has the new mask bit set would be unreachable by InvalidateCache
+        FEXCore::Allocator::VirtualDontNeed(reinterpret_cast<void*>(L1Pointer), CurrentL1Entries * sizeof(LookupCacheEntry), false);
+
+        CurrentL1Entries <<= 1;
+        L1PointerMask = CurrentL1Entries - 1;
+
+        // Update the thread's L1 pointer mask to increase how much cache it uses.
+        // Since we're in C-code, this is safe to update here.
+        Thread->CurrentFrame->State.L1Mask = GetScaledL1PointerMask();
+
+        // If L1 was just grown and cleared, re-insert our cached entry.
+        AddL1Entry(GuestAddress, HostCode);
+      }
+    } else if (AveragePerSecond < DynamicL1CacheDecreaseCountHeuristic()) {
+      if (CurrentL1Entries > MIN_L1_ENTRIES) {
+        CurrentL1Entries >>= 1;
+        L1PointerMask = CurrentL1Entries - 1;
+
+        // Madvise the entries that we are dropping. Gives the memory back to the OS.
+        LookupCacheEntry* FirstZeroL1Entry = &reinterpret_cast<LookupCacheEntry*>(L1Pointer)[CurrentL1Entries];
+        size_t ZeroMemorySize = (MAX_L1_ENTRIES - CurrentL1Entries) * sizeof(LookupCacheEntry);
+        FEXCore::Allocator::VirtualDontNeed(FirstZeroL1Entry, ZeroMemorySize, false);
+
+        // Update the thread's L1 pointer mask to decrease how much cache it uses.
+        // Since we're in C-code, this is safe to update here.
+        Thread->CurrentFrame->State.L1Mask = GetScaledL1PointerMask();
+      }
+    }
+
+    L2L3CacheHits = 0;
   }
 
   GuestToHostMap* Shared = nullptr;
@@ -508,8 +536,23 @@ private:
 
   size_t CurrentL1Entries = MIN_L1_ENTRIES;
   uint64_t L2L3CacheHits {};
-  std::chrono::time_point<std::chrono::system_clock> LastPeriod {};
+  constexpr static uint64_t SAMPLE_CHECK_STRIDE = 32; // Must be a power of 2
+  static_assert((SAMPLE_CHECK_STRIDE & (SAMPLE_CHECK_STRIDE - 1)) == 0, "SAMPLE_CHECK_STRIDE must be a power of 2");
+#ifdef ARCHITECTURE_arm64
+  static inline uint64_t ReadSampleCounter() {
+    uint64_t Result {};
+    // An unsynchronized CNTVCT_EL0 read avoids an ISB pipeline flush; a few cycles of
+    // reordering jitter is negligible over a 1-second sampling window.
+    __asm volatile("mrs %[Res], CNTVCT_EL0;" : [Res] "=r"(Result));
+    return Result;
+  }
+
+  uint64_t LastPeriodTicks {};
+  constexpr static uint64_t SamplePeriodSeconds {1};
+#else
+  std::chrono::steady_clock::time_point LastPeriod {};
   constexpr static std::chrono::seconds SamplePeriod {1};
+#endif
   FEX_CONFIG_OPT(DynamicL1CacheIncreaseCountHeuristic, DYNAMICL1CACHEINCREASECOUNTHEURISTIC);
   FEX_CONFIG_OPT(DynamicL1CacheDecreaseCountHeuristic, DYNAMICL1CACHEDECREASECOUNTHEURISTIC);
 
