@@ -224,16 +224,17 @@ void Dispatcher::EmitDispatcher() {
 
       // If we've made it here then we have a real compiled block
       {
-        // update L1 cache
-        // Calculate (L1Pointer + ((HashL1Index(ripreg) & L1_ENTRIES_MASK) << 4)) for the address.
+        // update 2-way L1 cache (Way 0 only here; lockless path must not copy Way 0 -> Way 1
+        // to avoid resurrecting an entry concurrently cleared by cross-thread InvalidateCache).
+        // Calculate (L1Pointer + ((HashL1Index(ripreg) & L1_SETS_MASK) << 5)) for the 32-byte set.
         // L1Mask is pre-shifted; TMP3 (RipReg) and TMP4 (HostCode) are live across this update.
         eor(ARMEmitter::Size::i64Bit, TMP1, RipReg.R(), RipReg.R(), ARMEmitter::ShiftType::LSR, LookupCache::L1_HASH_SHIFT);
         ldr(TMP2, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.L1Mask));
-        and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, TMP1.R(), ARMEmitter::ShiftType::LSL, FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry)));
+        and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, TMP1.R(), ARMEmitter::ShiftType::LSL, FEXCore::ilog2(sizeof(LookupCache::L1Set)));
         ldr(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.L1Pointer));
         add(TMP1, TMP1, TMP2);
 
-        stp<ARMEmitter::IndexType::OFFSET>(TMP4, RipReg, TMP1);
+        stp<ARMEmitter::IndexType::OFFSET>(TMP4, RipReg, TMP1, 0);
 
         // Jump to the block
         br(TMP4);
@@ -571,16 +572,22 @@ void Dispatcher::EmitDispatcher() {
       add(ARMEmitter::Size::i64Bit, TMP3, TMP3, rip_offset);
     }
 
-    // Calculate (tmp1 + ((HashL1Index(tmp3) & L1_ENTRIES_MASK) << 4)) for the address
+    // Calculate (tmp1 + ((HashL1Index(tmp3) & L1_SETS_MASK) << 5)) for the 32-byte set.
     // L1Mask is pre-shifted.
     eor(ARMEmitter::Size::i64Bit, TMP4, TMP3, TMP3, ARMEmitter::ShiftType::LSR, LookupCache::L1_HASH_SHIFT);
-    and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, TMP4, ARMEmitter::ShiftType::LSL, FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry)));
+    and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, TMP4, ARMEmitter::ShiftType::LSL, FEXCore::ilog2(sizeof(LookupCache::L1Set)));
     add(TMP1, TMP1, TMP2);
 
-    ldp<ARMEmitter::IndexType::OFFSET>(TMP2, TMP1, TMP1, 0);
+    ARMEmitter::ForwardLabel L1Hit;
+    ldp<ARMEmitter::IndexType::OFFSET>(TMP2, TMP4, TMP1, 0);
+    sub(TMP4, TMP4, TMP3);
+    (void)cbz(ARMEmitter::Size::i64Bit, TMP4, &L1Hit);
 
-    sub(TMP1, TMP1, TMP3);
-    (void)cbnz(ARMEmitter::Size::i64Bit, TMP1, &LoopTop);
+    ldp<ARMEmitter::IndexType::OFFSET>(TMP2, TMP4, TMP1, sizeof(LookupCache::LookupCacheEntry));
+    sub(TMP4, TMP4, TMP3);
+    (void)cbnz(ARMEmitter::Size::i64Bit, TMP4, &LoopTop);
+
+    (void)Bind(&L1Hit);
     br(TMP2);
   };
 

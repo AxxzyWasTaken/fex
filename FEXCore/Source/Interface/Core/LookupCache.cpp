@@ -63,10 +63,10 @@ LookupCache::LookupCache(FEXCore::Context::ContextImpl* CTX)
 
   if (DynamicL1Cache()) {
     // Start at minimum size when dynamic.
-    L1PointerMask = MIN_L1_ENTRIES - 1;
+    L1PointerMask = MIN_L1_SETS - 1;
   } else {
     // Start at maximum instead.
-    L1PointerMask = MAX_L1_ENTRIES - 1;
+    L1PointerMask = MAX_L1_SETS - 1;
   }
 
 #ifdef ARCHITECTURE_arm64

@@ -180,10 +180,17 @@ public:
     uintptr_t GuestCode;
   };
 
+  static constexpr size_t L1_WAYS = 2;
+  struct L1Set {
+    LookupCacheEntry Ways[L1_WAYS];
+  };
+  static_assert(sizeof(L1Set) == L1_WAYS * sizeof(LookupCacheEntry));
+  static_assert(sizeof(L1Set) == 32);
+
   static constexpr uint32_t L1_HASH_SHIFT = 4;
 
   // Mix bits [k+3:4] into [k-1:0] so 16-byte-aligned x86-64 function entrypoints
-  // utilize all L1 slots instead of only every 16th slot, while remaining collision-free
+  // utilize all L1 sets instead of only every 16th set, while remaining collision-free
   // within any naturally aligned 2^k-byte window and mask-independent for DynamicL1Cache.
   static constexpr uint64_t HashL1Index(uint64_t Address) {
     return Address ^ (Address >> L1_HASH_SHIFT);
@@ -200,10 +207,13 @@ public:
   }
 
   uintptr_t FindBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t Address) {
-    // Try L1, no lock needed
-    auto& L1Entry = reinterpret_cast<LookupCacheEntry*>(L1Pointer)[HashL1Index(Address) & L1PointerMask];
-    if (L1Entry.GuestCode == Address) {
-      return L1Entry.HostCode;
+    // Try 2-way L1, no lock needed
+    auto& L1Bucket = reinterpret_cast<L1Set*>(L1Pointer)[HashL1Index(Address) & L1PointerMask];
+    if (L1Bucket.Ways[0].GuestCode == Address) {
+      return L1Bucket.Ways[0].HostCode;
+    }
+    if (L1Bucket.Ways[1].GuestCode == Address) {
+      return L1Bucket.Ways[1].HostCode;
     }
 
     // L2 and L3 need to be locked
@@ -228,9 +238,8 @@ public:
           auto BlockPointers = reinterpret_cast<LookupCacheEntry*>(LocalPagePointer);
 
           if (BlockPointers[PageOffset].GuestCode == Address) {
-            L1Entry.GuestCode = Address;
-            L1Entry.HostCode = BlockPointers[PageOffset].HostCode;
-            HostPtr = L1Entry.HostCode;
+            HostPtr = BlockPointers[PageOffset].HostCode;
+            AddL1Entry(Address, HostPtr);
           }
         }
       }
@@ -301,7 +310,7 @@ public:
         FEXCore::Allocator::VirtualDontNeed(reinterpret_cast<void*>(L1Pointer), CurrentL1Entries * sizeof(LookupCacheEntry), false);
 
         CurrentL1Entries <<= 1;
-        L1PointerMask = CurrentL1Entries - 1;
+        L1PointerMask = (CurrentL1Entries / L1_WAYS) - 1;
 
         // Update the thread's L1 pointer mask to increase how much cache it uses.
         // Since we're in C-code, this is safe to update here.
@@ -313,7 +322,7 @@ public:
     } else if (AveragePerSecond < DynamicL1CacheDecreaseCountHeuristic()) {
       if (CurrentL1Entries > MIN_L1_ENTRIES) {
         CurrentL1Entries >>= 1;
-        L1PointerMask = CurrentL1Entries - 1;
+        L1PointerMask = (CurrentL1Entries / L1_WAYS) - 1;
 
         // Madvise the entries that we are dropping. Gives the memory back to the OS.
         LookupCacheEntry* FirstZeroL1Entry = &reinterpret_cast<LookupCacheEntry*>(L1Pointer)[CurrentL1Entries];
@@ -364,13 +373,15 @@ public:
 
   // Invalidates L1/L2 for a given guest block
   void InvalidateCache(uint64_t Address, const LookupCacheWriteLockToken& lk) {
-    // Do L1
-    auto& L1Entry = reinterpret_cast<LookupCacheEntry*>(L1Pointer)[HashL1Index(Address) & L1PointerMask];
-    if (L1Entry.GuestCode == Address) {
-      L1Entry.GuestCode = 0;
-      // Leave L1Entry.HostCode as is, so that concurrent lookups won't read a null pointer
-      // This is a soft guarantee for cross thread invalidation, as atomics are not used
-      // and it hasn't been thoroughly tested
+    // Do 2-way L1
+    auto& L1Bucket = reinterpret_cast<L1Set*>(L1Pointer)[HashL1Index(Address) & L1PointerMask];
+    for (auto& Way : L1Bucket.Ways) {
+      if (Way.GuestCode == Address) {
+        Way.GuestCode = 0;
+        // Leave Way.HostCode as is, so that concurrent lookups won't read a null pointer
+        // This is a soft guarantee for cross thread invalidation, as atomics are not used
+        // and it hasn't been thoroughly tested
+      }
     }
 
     if (!DisableL2Cache()) {
@@ -437,7 +448,7 @@ public:
     return L1Pointer;
   }
   uintptr_t GetScaledL1PointerMask() const {
-    return L1PointerMask << FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry));
+    return L1PointerMask << FEXCore::ilog2(sizeof(LookupCache::L1Set));
   }
   uintptr_t GetPagePointer() const {
     return PagePointer;
@@ -459,9 +470,20 @@ public:
 
 private:
   void AddL1Entry(uint64_t GuestAddress, uint64_t HostCode) {
-    auto& L1Entry = reinterpret_cast<LookupCacheEntry*>(L1Pointer)[HashL1Index(GuestAddress) & L1PointerMask];
-    L1Entry.GuestCode = GuestAddress;
-    L1Entry.HostCode = HostCode;
+    auto& L1Bucket = reinterpret_cast<L1Set*>(L1Pointer)[HashL1Index(GuestAddress) & L1PointerMask];
+    if (L1Bucket.Ways[0].GuestCode == GuestAddress) {
+      L1Bucket.Ways[0].HostCode = HostCode;
+      return;
+    }
+    if (L1Bucket.Ways[0].GuestCode != 0) {
+      // Demote previous MRU entry to Way 1 (whether replacing Way 1 or promoting a Way 1 hit).
+      L1Bucket.Ways[1] = L1Bucket.Ways[0];
+    } else if (L1Bucket.Ways[1].GuestCode == GuestAddress) {
+      // Avoid duplicate entries if Way 0 was previously invalidated.
+      L1Bucket.Ways[1].GuestCode = 0;
+    }
+    L1Bucket.Ways[0].HostCode = HostCode;
+    L1Bucket.Ways[0].GuestCode = GuestAddress;
   }
 
   void CacheBlockMapping(uint64_t Address, const GuestToHostMap::BlockEntry& Entry, bool L1Only, const LookupCacheBaseLockToken& lk) {
@@ -529,10 +551,12 @@ private:
 
   size_t TotalCacheSize;
 
-  // Start with 8k entries in L1 to give 128KB of L1 cache to each thread.
-  // Max out at 1 million entries to give each thread 16MB of L1 cache maximum.
+  // Start with 8k entries (4k 2-way sets) in L1 to give 128KB of L1 cache to each thread.
+  // Max out at 1 million entries (512k 2-way sets) to give each thread 16MB of L1 cache maximum.
   constexpr static size_t MIN_L1_ENTRIES = 8 * 1024;        // Must be a power of 2
   constexpr static size_t MAX_L1_ENTRIES = 1 * 1024 * 1024; // Must be a power of 2
+  constexpr static size_t MIN_L1_SETS = MIN_L1_ENTRIES / L1_WAYS;
+  constexpr static size_t MAX_L1_SETS = MAX_L1_ENTRIES / L1_WAYS;
 
   constexpr static size_t CODE_SIZE = 128 * 1024 * 1024;
   constexpr static size_t SIZE_PER_PAGE = FEXCore::Utils::FEX_PAGE_SIZE * sizeof(LookupCacheEntry);
