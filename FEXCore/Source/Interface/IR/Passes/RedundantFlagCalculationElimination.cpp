@@ -174,6 +174,8 @@ private:
   unsigned FlagsForCondClassType(CondClass Cond);
   template<bool kDryRun>
   [[gnu::always_inline]] bool EliminateDeadCode(IREmitter* IREmit, IRListView& CurrentIR, Ref CodeNode, IROp_Header* IROp);
+  template<bool kAPFLG>
+  void PromoteNarrowSubNZCV(IREmitter* IREmit, IRListView& CurrentIR, Ref CodeNode, IROp_Header* IROp);
   void FoldBranch(IREmitter* IREmit, IRListView& CurrentIR, IROp_CondJump* Op, Ref CodeNode);
   CondClass X86ToArmFloatCond(CondClass X86);
   // kSolve: SolveFromNothingLive, which also narrows LoadNZCV reads and, with
@@ -663,6 +665,132 @@ CondClass DeadFlagCalculationEliminination::X86ToArmFloatCond(CondClass X86) {
   }
 }
 
+static bool IsZeroExtendedTo(IRListView& CurrentIR, OrderedNodeWrapper Arg, uint32_t Bits) {
+  const uint64_t Mask = (1ULL << Bits) - 1;
+  const auto* Header = CurrentIR.GetOp<IROp_Header>(Arg);
+
+  switch (Header->Op) {
+  case OP_LOADMEM: {
+    const auto* Op = Header->C<IR::IROp_LoadMem>();
+    return Op->Class == RegClass::GPR && (Header->Size == OpSize::i8Bit || (Bits >= 16 && Header->Size == OpSize::i16Bit));
+  }
+  case OP_LOADMEMTSO: {
+    const auto* Op = Header->C<IR::IROp_LoadMemTSO>();
+    return Op->Class == RegClass::GPR && (Header->Size == OpSize::i8Bit || (Bits >= 16 && Header->Size == OpSize::i16Bit));
+  }
+  case OP_CONSTANT: return Header->C<IR::IROp_Constant>()->Constant <= Mask;
+  case OP_INLINECONSTANT: return Header->C<IR::IROp_InlineConstant>()->Constant <= Mask;
+  case OP_BFE: return Header->C<IR::IROp_Bfe>()->Width <= Bits;
+  case OP_AND:
+  case OP_ANDWITHFLAGS: {
+    if (Header->Size < OpSize::i32Bit) {
+      return false;
+    }
+    for (unsigned i = 0; i < 2; ++i) {
+      const auto* Src = CurrentIR.GetOp<IROp_Header>(Header->Args[i]);
+      if (Src->Op == OP_INLINECONSTANT && Src->C<IR::IROp_InlineConstant>()->Constant <= Mask) {
+        return true;
+      }
+      if (Src->Op == OP_CONSTANT && Src->C<IR::IROp_Constant>()->Constant <= Mask) {
+        return true;
+      }
+    }
+    return false;
+  }
+  default: return false;
+  }
+}
+
+static bool SameCompareOperand(IRListView& CurrentIR, OrderedNodeWrapper OpArg, OrderedNodeWrapper FixArg) {
+  if (OpArg == FixArg) {
+    return true;
+  }
+  const auto* OpHeader = CurrentIR.GetOp<IROp_Header>(OpArg);
+  const auto* FixHeader = CurrentIR.GetOp<IROp_Header>(FixArg);
+  return OpHeader->Op == OP_INLINECONSTANT && OpHeader->C<IR::IROp_InlineConstant>()->Constant == 0 && FixHeader->Op == OP_CONSTANT &&
+         FixHeader->C<IR::IROp_Constant>()->Constant == 0;
+}
+
+static Ref FindPairedAPFLGFromCompare(IRListView& CurrentIR, Ref CodeNode, IROp_Header* CmpOp, bool IsAdd) {
+  const auto NextWrap = CodeNode->Header.Next;
+  if (NextWrap.IsInvalid()) {
+    return nullptr;
+  }
+  const auto* NextHeader = CurrentIR.GetOp<IROp_Header>(NextWrap);
+  if (NextHeader->Op != OP_APFLGFROMCOMPARE) {
+    return nullptr;
+  }
+  const auto* FixOp = NextHeader->C<IR::IROp_APFLGFromCompare>();
+  if (FixOp->IsAdd != IsAdd) {
+    return nullptr;
+  }
+  if (!SameCompareOperand(CurrentIR, CmpOp->Args[0], FixOp->Src1) || !SameCompareOperand(CurrentIR, CmpOp->Args[1], FixOp->Src2)) {
+    return nullptr;
+  }
+  return CurrentIR.GetNode(NextWrap);
+}
+
+template<bool kAPFLG>
+void DeadFlagCalculationEliminination::PromoteNarrowSubNZCV(IREmitter* IREmit, IRListView& CurrentIR, Ref CodeNode, IROp_Header* IROp) {
+  if (IROp->Size != OpSize::i8Bit && IROp->Size != OpSize::i16Bit) {
+    return;
+  }
+
+  const uint32_t Bits = IR::OpSizeAsBits(IROp->Size);
+  const uint64_t Mask = (1ULL << Bits) - 1;
+  Ref PairedAPFLG = kAPFLG ? FindPairedAPFLGFromCompare(CurrentIR, CodeNode, IROp, false) : nullptr;
+
+  const auto* Src1Header = CurrentIR.GetOp<IROp_Header>(IROp->Args[0]);
+  const auto* Src2Header = CurrentIR.GetOp<IROp_Header>(IROp->Args[1]);
+  const bool Src1IsRealGPR = Src1Header->Op != OP_INLINECONSTANT && Src1Header->Op != OP_INLINEENTRYPOINTOFFSET;
+  const bool Src1Zext = IsZeroExtendedTo(CurrentIR, IROp->Args[0], Bits);
+  const bool Src2Zext = IsZeroExtendedTo(CurrentIR, IROp->Args[1], Bits);
+
+  bool CanInlineSrc2Imm = false;
+  uint64_t MaskedSrc2Imm = 0;
+  if (Src1IsRealGPR && Src2Header->Op == OP_CONSTANT) {
+    MaskedSrc2Imm = Src2Header->C<IR::IROp_Constant>()->Constant & Mask;
+    CanInlineSrc2Imm = ARMEmitter::IsImmAddSub(MaskedSrc2Imm);
+  }
+
+  // Case 1: Src1 is already zero-extended and Src2 is either zero-extended or
+  // an inlinable narrow immediate. Unshifted 32-bit cmp computes identical Z, C
+  // (CFInverted = true) and Apple APFLG PF/AF.
+  if (Src1Zext && (Src2Zext || CanInlineSrc2Imm)) {
+    IROp->Size = OpSize::i32Bit;
+    if (CanInlineSrc2Imm) {
+      IREmit->SetWriteCursorBefore(CodeNode);
+      Ref NewImm = IREmit->_InlineConstant(MaskedSrc2Imm);
+      IREmit->ReplaceNodeArgument(CodeNode, 1, NewImm);
+    }
+    if (PairedAPFLG) {
+      IREmit->Remove(PairedAPFLG);
+    }
+    return;
+  }
+
+  // Case 2: Unextended real GPR compared against an inlinable narrow immediate
+  // (e.g. cmp cl, 1; cmovbe). Emit explicit zero-extension + 32-bit cmp #imm
+  // only when it strictly reduces instructions (either eliminating the
+  // materialized constant or deleting a live paired APFLGFromCompare).
+  if (Src1IsRealGPR && CanInlineSrc2Imm) {
+    Ref Src2Node = CurrentIR.GetNode(IROp->Args[1]);
+    const uint32_t EffectiveSrc2Uses = Src2Node->GetUses() - (PairedAPFLG ? 1U : 0U);
+    if (EffectiveSrc2Uses == 1 || PairedAPFLG) {
+      Ref Src1Node = CurrentIR.GetNode(IROp->Args[0]);
+      IREmit->SetWriteCursorBefore(CodeNode);
+      Ref ZextSrc1 = IREmit->_Bfe(OpSize::i32Bit, Bits, 0, Src1Node);
+      Ref NewImm = IREmit->_InlineConstant(MaskedSrc2Imm);
+      IROp->Size = OpSize::i32Bit;
+      IREmit->ReplaceNodeArgument(CodeNode, 0, ZextSrc1);
+      IREmit->ReplaceNodeArgument(CodeNode, 1, NewImm);
+      if (PairedAPFLG) {
+        IREmit->Remove(PairedAPFLG);
+      }
+    }
+  }
+}
+
 void DeadFlagCalculationEliminination::FoldBranch(IREmitter* IREmit, IRListView& CurrentIR, IROp_CondJump* Op, Ref CodeNode) {
   // Skip past StoreRegisters at the end -- they don't touch flags.
   auto PrevWrap = CodeNode->Header.Previous;
@@ -774,9 +902,30 @@ bool DeadFlagCalculationEliminination::ProcessBlock(IREmitter* IREmit, IRListVie
         });
       }
 
+      // APFLG: a LoadNZCV whose sole live user is an immediate BFE extracting
+      // only bits 26/27 (PF/AF) does not read N/Z/C/V.
+      bool NarrowedLoadNZCV = false;
+      if (kAPFLG && IROp->Op == OP_LOADNZCV && Uses<kDryRun>(CurrentIR, CodeNode) == 1) {
+        const auto NextWrap = CodeNode->Header.Next;
+        if (!NextWrap.IsInvalid()) {
+          Ref NextNode = CurrentIR.GetNode(NextWrap);
+          const auto* NextHeader = CurrentIR.GetOp<IROp_Header>(NextNode);
+          if (NextHeader->Op == OP_BFE && Uses<kDryRun>(CurrentIR, NextNode) > 0) {
+            const auto* Bfe = NextHeader->C<IR::IROp_Bfe>();
+            if (Bfe->Src.ID() == CurrentIR.GetID(CodeNode) && Bfe->lsb >= 26 && (Bfe->lsb + Bfe->Width) <= 28) {
+              const unsigned Lo = Bfe->lsb;
+              const unsigned Hi = Bfe->lsb + Bfe->Width;
+              const unsigned ReadPA = ((Lo <= 26 && 26 < Hi) ? FLAG_P : 0U) | ((Lo <= 27 && 27 < Hi) ? FLAG_A : 0U);
+              Info = FlagInfo::Pack({.Read = ReadPA});
+              NarrowedLoadNZCV = true;
+            }
+          }
+        }
+      }
+
       // APFLG: a LoadNZCV reads PF/AF only for users of bits 26/27, such as
       // the PF/AF a following ADCX/ADOX keeps. RMIF #28 reads bits 28-31.
-      if (kSolve && IROp->Op == OP_LOADNZCV) {
+      if (kSolve && !NarrowedLoadNZCV && IROp->Op == OP_LOADNZCV) {
         const auto ID = CurrentIR.GetID(CodeNode).Value;
         Touch(ID, CodeNode);
         if (Scratch.Seen[ID] == Uses<kDryRun>(CurrentIR, CodeNode)) {
@@ -787,10 +936,43 @@ bool DeadFlagCalculationEliminination::ProcessBlock(IREmitter* IREmit, IRListVie
         }
       }
 
+      const uint32_t PreFlagsRead = FlagsRead;
       bool Eliminated = false;
       if (!Info.Trivial()) {
         if ((FlagsRead & Info.Write()) == 0) {
-          if ((Info.CanEliminate() || Info.Replacement()) && Uses<kDryRun>(CurrentIR, CodeNode) == 0) {
+          if constexpr (kAPFLG && !kDryRun) {
+            // If all NZCV flags are dead after a narrow compare/add but its
+            // paired APFLGFromCompare survived (only PF/AF live), an unshifted
+            // 32-bit cmp/cmn computes PF/AF directly without mrs+rmif.
+            if ((IROp->Op == OP_SUBNZCV || IROp->Op == OP_ADDNZCV) && IROp->Size < OpSize::i32Bit && Uses<kDryRun>(CurrentIR, CodeNode) == 0) {
+              const bool IsAdd = IROp->Op == OP_ADDNZCV;
+              if (Ref PairedAPFLG = FindPairedAPFLGFromCompare(CurrentIR, CodeNode, IROp, IsAdd)) {
+                const uint32_t Bits = IR::OpSizeAsBits(IROp->Size);
+                const uint64_t Mask = (1ULL << Bits) - 1;
+                const auto* Src1Header = CurrentIR.GetOp<IROp_Header>(IROp->Args[0]);
+                const auto* Src2Header = CurrentIR.GetOp<IROp_Header>(IROp->Args[1]);
+                const bool Src1IsRealGPR = Src1Header->Op != OP_INLINECONSTANT && Src1Header->Op != OP_INLINEENTRYPOINTOFFSET;
+                IROp->Size = OpSize::i32Bit;
+                if (Src1IsRealGPR && Src2Header->Op == OP_CONSTANT) {
+                  const uint64_t MaskedImm = Src2Header->C<IR::IROp_Constant>()->Constant & Mask;
+                  if (ARMEmitter::IsImmAddSub(MaskedImm)) {
+                    IREmit->SetWriteCursorBefore(CodeNode);
+                    Ref NewImm = IREmit->_InlineConstant(MaskedImm);
+                    IREmit->ReplaceNodeArgument(CodeNode, 1, NewImm);
+                  }
+                }
+                IREmit->Remove(PairedAPFLG);
+              } else {
+                RemoveNode<kDryRun>(IREmit, CurrentIR, CodeNode, IROp);
+                Eliminated = true;
+              }
+            } else if ((Info.CanEliminate() || Info.Replacement()) && Uses<kDryRun>(CurrentIR, CodeNode) == 0) {
+              RemoveNode<kDryRun>(IREmit, CurrentIR, CodeNode, IROp);
+              Eliminated = true;
+            } else if (Info.Replacement()) {
+              IROp->Op = Info.Replacement();
+            }
+          } else if ((Info.CanEliminate() || Info.Replacement()) && Uses<kDryRun>(CurrentIR, CodeNode) == 0) {
             RemoveNode<kDryRun>(IREmit, CurrentIR, CodeNode, IROp);
             Eliminated = true;
           } else if (Info.Replacement() && !kDryRun) {
@@ -807,6 +989,12 @@ bool DeadFlagCalculationEliminination::ProcessBlock(IREmitter* IREmit, IRListVie
         // iteration.
         if (IROp->Op == OP_TESTNZ && IROp->Size < OpSize::i32Bit && !(FlagsRead & (FLAG_N | FLAG_C)) && !kDryRun) {
           IROp->Op = OP_TESTZ;
+        }
+
+        if constexpr (!kDryRun) {
+          if (!Eliminated && IROp->Op == OP_SUBNZCV && IROp->Size < OpSize::i32Bit && !(PreFlagsRead & (FLAG_N | FLAG_V))) {
+            PromoteNarrowSubNZCV<kAPFLG>(IREmit, CurrentIR, CodeNode, IROp);
+          }
         }
 
         FlagsRead &= ~Info.Write();
@@ -1010,8 +1198,11 @@ void DeadFlagCalculationEliminination::Run(IREmitter* IREmit) {
   }
 
   if (APFLG && Scratch.WriteBack && CFG.BlockMap.size() > 1) {
+    CurrentIR = IREmit->ViewIR();
     SolveFromNothingLive(IREmit, CurrentIR, CFG);
   }
+
+  CurrentIR = IREmit->ViewIR();
 
   // Fold compares into branches now that we're otherwise optimized. This needs
   // to run after eliminating carries etc and it needs the global flag metadata.

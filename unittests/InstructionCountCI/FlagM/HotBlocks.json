@@ -370,7 +370,7 @@
     },
     "bytemark huffman 3": {
       "x86InstructionCount": 19,
-      "ExpectedInstructionCount": 34,
+      "ExpectedInstructionCount": 32,
       "x86Insts": [
         "mov    ecx,eax",
         "and    cl,0x7",
@@ -413,11 +413,9 @@
         "bfxil x15, x20, #0, #8",
         "orr w20, w12, w14",
         "bfxil x12, x20, #0, #8",
-        "mov w20, #0x31",
-        "add x21, x8, x11",
-        "ldrb w21, [x21, #79]",
-        "lsl w0, w21, #24",
-        "cmp w0, w20, lsl #24",
+        "add x20, x8, x11",
+        "ldrb w20, [x20, #79]",
+        "cmp w20, #0x31 (49)",
         "uxtb w7, w12",
         "uxtb w12, w15",
         "csel w12, w7, w12, eq",

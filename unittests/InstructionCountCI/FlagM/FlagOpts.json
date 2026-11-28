@@ -383,6 +383,289 @@
         "csel x5, x21, x5, ne",
         "subs x26, x4, #0x0 (0)"
       ]
+    },
+    "Narrow cmp byte mem imm8 (unsigned cmove)": {
+      "x86InstructionCount": 3,
+      "ExpectedInstructionCount": 4,
+      "x86Insts": [
+        "cmp byte [rdi], 0x31",
+        "cmove eax, ebx",
+        "test eax, eax"
+      ],
+      "ExpectedArm64ASM": [
+        "ldrb w20, [x11]",
+        "cmp w20, #0x31 (49)",
+        "csel w4, w6, w4, eq",
+        "subs w26, w4, #0x0 (0)"
+      ]
+    },
+    "Narrow cmp byte mem zero (unsigned je)": {
+      "x86InstructionCount": 4,
+      "ExpectedInstructionCount": 5,
+      "x86Insts": [
+        "cmp byte [rdi], 0",
+        "je .t",
+        "nop",
+        ".t: xor ecx, ecx"
+      ],
+      "ExpectedArm64ASM": [
+        "ldrb w20, [x11]",
+        "cmp w20, #0x0 (0)",
+        "b.eq #+0x4",
+        "subs w26, w7, w7",
+        "mov w7, #0x0"
+      ]
+    },
+    "Narrow cmp reg imm8 (Factorio cmovbe)": {
+      "x86InstructionCount": 5,
+      "ExpectedInstructionCount": 6,
+      "x86Insts": [
+        "sub ecx, 0x9",
+        "xor r11d, r11d",
+        "cmp cl, 0x1",
+        "cmovbe r11, rsi",
+        "test r11, r11"
+      ],
+      "ExpectedArm64ASM": [
+        "sub w7, w7, #0x9 (9)",
+        "mov w15, #0x0",
+        "uxtb w20, w7",
+        "cmp w20, #0x1 (1)",
+        "csel x15, x10, x15, ls",
+        "subs x26, x15, #0x0 (0)"
+      ]
+    },
+    "Narrow cmp reg zero (unsigned je)": {
+      "x86InstructionCount": 4,
+      "ExpectedInstructionCount": 5,
+      "x86Insts": [
+        "cmp cl, 0",
+        "je .t",
+        "nop",
+        ".t: xor eax, eax"
+      ],
+      "ExpectedArm64ASM": [
+        "uxtb w20, w7",
+        "cmp w20, #0x0 (0)",
+        "b.eq #+0x4",
+        "subs w26, w4, w4",
+        "mov w4, #0x0"
+      ]
+    },
+    "Narrow cmp reg 0x80 (unsigned jb)": {
+      "x86InstructionCount": 4,
+      "ExpectedInstructionCount": 5,
+      "x86Insts": [
+        "cmp cl, 0x80",
+        "jb .t",
+        "nop",
+        ".t: xor eax, eax"
+      ],
+      "ExpectedArm64ASM": [
+        "uxtb w20, w7",
+        "cmp w20, #0x80 (128)",
+        "b.lo #+0x4",
+        "subs w26, w4, w4",
+        "mov w4, #0x0"
+      ]
+    },
+    "Narrow cmp reg 0x7f (signed jl - must not promote)": {
+      "x86InstructionCount": 4,
+      "ExpectedInstructionCount": 6,
+      "x86Insts": [
+        "cmp cl, 0x7f",
+        "jl .t",
+        "nop",
+        ".t: xor eax, eax"
+      ],
+      "ExpectedArm64ASM": [
+        "mov w20, #0x7f",
+        "lsl w0, w7, #24",
+        "cmp w0, w20, lsl #24",
+        "b.lt #+0x4",
+        "subs w26, w4, w4",
+        "mov w4, #0x0"
+      ]
+    },
+    "Narrow cmp byte mem 0x80 (signed jl - must not promote)": {
+      "x86InstructionCount": 4,
+      "ExpectedInstructionCount": 7,
+      "x86Insts": [
+        "cmp byte [rdi], 0x80",
+        "jl .t",
+        "nop",
+        ".t: xor eax, eax"
+      ],
+      "ExpectedArm64ASM": [
+        "mov w20, #0x80",
+        "ldrb w21, [x11]",
+        "lsl w0, w21, #24",
+        "cmp w0, w20, lsl #24",
+        "b.lt #+0x4",
+        "subs w26, w4, w4",
+        "mov w4, #0x0"
+      ]
+    },
+    "Narrow cmp byte mem 0x31 + lahf (must not promote)": {
+      "x86InstructionCount": 3,
+      "ExpectedInstructionCount": 21,
+      "x86Insts": [
+        "cmp byte [rdi], 0x31",
+        "lahf",
+        "test eax, eax"
+      ],
+      "ExpectedArm64ASM": [
+        "mov w20, #0x31",
+        "ldrb w21, [x11]",
+        "mvn w27, w21",
+        "lsl w0, w21, #24",
+        "cmp w0, w20, lsl #24",
+        "sub w26, w21, #0x31 (49)",
+        "cset x20, lo",
+        "eor x21, x27, x26",
+        "ubfx w21, w21, #4, #1",
+        "orr x20, x20, x21, lsl #4",
+        "eor w0, w26, w26, lsr #4",
+        "eor w0, w0, w0, lsr #2",
+        "eor w21, w0, w0, lsr #1",
+        "orr x21, x21, #0xfffffffffffffffe",
+        "orn x20, x20, x21, ror #62",
+        "mrs x21, nzcv",
+        "and x21, x21, #0xc0000000",
+        "orr x20, x20, x21, lsr #24",
+        "orr x20, x20, #0x2",
+        "bfi x4, x20, #8, #8",
+        "subs w26, w4, #0x0 (0)"
+      ]
+    },
+    "Narrow cmp word mem 0x1000 (unsigned jbe)": {
+      "x86InstructionCount": 4,
+      "ExpectedInstructionCount": 5,
+      "x86Insts": [
+        "cmp word [rdi], 0x1000",
+        "jbe .t",
+        "nop",
+        ".t: xor eax, eax"
+      ],
+      "ExpectedArm64ASM": [
+        "ldrh w20, [x11]",
+        "cmp w20, #0x1000 (4096)",
+        "b.ls #+0x4",
+        "subs w26, w4, w4",
+        "mov w4, #0x0"
+      ]
+    },
+    "Narrow cmp word mem 0x1234 (non-imm promoted)": {
+      "x86InstructionCount": 4,
+      "ExpectedInstructionCount": 6,
+      "x86Insts": [
+        "cmp word [rdi], 0x1234",
+        "jbe .t",
+        "nop",
+        ".t: xor eax, eax"
+      ],
+      "ExpectedArm64ASM": [
+        "mov w20, #0x1234",
+        "ldrh w21, [x11]",
+        "cmp w21, w20",
+        "b.ls #+0x4",
+        "subs w26, w4, w4",
+        "mov w4, #0x0"
+      ]
+    },
+    "Narrow cmpsb (both LoadMem zext, unsigned setb)": {
+      "x86InstructionCount": 3,
+      "ExpectedInstructionCount": 9,
+      "x86Insts": [
+        "cmpsb",
+        "setb cl",
+        "test ecx, ecx"
+      ],
+      "ExpectedArm64ASM": [
+        "ldrb w20, [x11]",
+        "ldrb w21, [x10]",
+        "cmp w21, w20",
+        "ldrsb x20, [x28, #1018]",
+        "add x11, x11, x20",
+        "add x10, x10, x20",
+        "cset x20, lo",
+        "bfxil x7, x20, #0, #8",
+        "subs w26, w7, #0x0 (0)"
+      ]
+    },
+    "Narrow cmp byte mem vs reg (reg unextended - must not promote)": {
+      "x86InstructionCount": 4,
+      "ExpectedInstructionCount": 7,
+      "x86Insts": [
+        "movzx eax, byte [rdi]",
+        "cmp al, byte [rsi]",
+        "setb cl",
+        "test ecx, ecx"
+      ],
+      "ExpectedArm64ASM": [
+        "ldrb w4, [x11]",
+        "ldrb w20, [x10]",
+        "lsl w0, w4, #24",
+        "cmp w0, w20, lsl #24",
+        "cset x20, lo",
+        "bfxil x7, x20, #0, #8",
+        "subs w26, w7, #0x0 (0)"
+      ]
+    },
+    "Narrow cmp reg imm8 (unsigned setbe after and)": {
+      "x86InstructionCount": 4,
+      "ExpectedInstructionCount": 6,
+      "x86Insts": [
+        "and ecx, 0x7f",
+        "cmp cl, 0x3f",
+        "setbe al",
+        "test eax, eax"
+      ],
+      "ExpectedArm64ASM": [
+        "and w7, w7, #0x7f",
+        "uxtb w20, w7",
+        "cmp w20, #0x3f (63)",
+        "cset x20, ls",
+        "bfxil x4, x20, #0, #8",
+        "subs w26, w4, #0x0 (0)"
+      ]
+    },
+    "Narrow sub byte mem imm8 (unsigned setbe)": {
+      "x86InstructionCount": 3,
+      "ExpectedInstructionCount": 7,
+      "x86Insts": [
+        "sub byte [rdi], 1",
+        "setbe al",
+        "test eax, eax"
+      ],
+      "ExpectedArm64ASM": [
+        "ldrb w20, [x11]",
+        "cmp w20, #0x1 (1)",
+        "sub w20, w20, #0x1 (1)",
+        "strb w20, [x11]",
+        "cset x20, ls",
+        "bfxil x4, x20, #0, #8",
+        "subs w26, w4, #0x0 (0)"
+      ]
+    },
+    "Narrow add reg 0x80 (unsigned setb - must not promote)": {
+      "x86InstructionCount": 3,
+      "ExpectedInstructionCount": 8,
+      "x86Insts": [
+        "add cl, 0x80",
+        "setb al",
+        "test eax, eax"
+      ],
+      "ExpectedArm64ASM": [
+        "mov w20, #0x80",
+        "lsl w0, w7, #24",
+        "cmn w0, w20, lsl #24",
+        "add w20, w7, #0x80 (128)",
+        "bfxil x7, x20, #0, #8",
+        "cset x20, hs",
+        "bfxil x4, x20, #0, #8",
+        "subs w26, w4, #0x0 (0)"
+      ]
     }
   }
 }

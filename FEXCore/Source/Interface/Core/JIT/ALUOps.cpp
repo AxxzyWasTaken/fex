@@ -140,12 +140,10 @@ DEF_OP(AddNZCV) {
   } else if (IROp->Size < IR::OpSize::i32Bit) {
     unsigned Shift = 32 - IR::OpSizeAsBits(IROp->Size);
 
+    // Under APFLG, Flags.cpp emits a separate APFLGFromCompare so RFCE can
+    // eliminate it when PF/AF are dead.
     lsl(ARMEmitter::Size::i32Bit, TMP1, Src1, Shift);
     cmn(EmitSize, TMP1, GetReg(Op->Src2), ARMEmitter::ShiftType::LSL, Shift);
-
-    if (HostSupportsAPFLG) {
-      APFLGFixNarrowCompare(true, Src1, GetReg(Op->Src2));
-    }
   } else {
     cmn(EmitSize, Src1, GetReg(Op->Src2));
   }
@@ -293,11 +291,9 @@ DEF_OP(SubNZCV) {
     }
 
     if (OpSize < IR::OpSize::i32Bit) {
+      // Under APFLG, Flags.cpp emits a separate APFLGFromCompare so RFCE can
+      // eliminate it when PF/AF are dead or when SubNZCV is promoted to 32-bit.
       cmp(EmitSize, ShiftedSrc1, GetReg(Op->Src2), ARMEmitter::ShiftType::LSL, Shift);
-
-      if (HostSupportsAPFLG) {
-        APFLGFixNarrowCompare(false, GetZeroableReg(Op->Src1), GetReg(Op->Src2));
-      }
     } else {
       cmp(EmitSize, ShiftedSrc1, GetReg(Op->Src2));
     }

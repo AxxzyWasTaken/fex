@@ -433,19 +433,20 @@ Ref OpDispatchBuilder::CalculateFlags_SUB(IR::OpSize SrcSize, Ref Src1, Ref Src2
     // negated operand. Under APFLG keep the subtract so AF is x86's.
     Res = APFLG() ? _SubWithFlags(SrcSize, Src1, Src2) : SubWithFlags(SrcSize, Src1, Src2);
     CalculatePFAFFromHost(Res);
-  } else if (APFLG()) {
-    // 8/16-bit: a 32-bit compare of the operands shifted to the top gives the
-    // narrow NZCV. PF/AF come from a compare of the unshifted operands, which
-    // the dead-flag pass drops when they are not needed.
-    auto Shift = _InlineConstant(32 - IR::OpSizeAsBits(SrcSize));
-    _SubNZCV(OpSize::i32Bit, _Lshl(OpSize::i32Bit, Src1, Shift), _Lshl(OpSize::i32Bit, Src2, Shift));
-    _APFLGFromCompare(Src1, Src2, false);
-    Res = Sub(OpSize::i32Bit, Src1, Src2);
-    CalculatePFAFFromHost(Res);
   } else {
     _SubNZCV(SrcSize, Src1, Src2);
+    if (APFLG()) {
+      // Narrow SubNZCV sets NZCV via top-aligned shifts, which clobbers
+      // APFLG PF/AF. Recompute PF/AF from the unshifted operands; RFCE drops
+      // this op when PF/AF are dead or when SubNZCV is promoted to 32-bit.
+      _APFLGFromCompare(Src1, Src2, false);
+    }
     Res = Sub(OpSize::i32Bit, Src1, Src2);
-    CalculatePF(Res);
+    if (APFLG()) {
+      CalculatePFAFFromHost(Res);
+    } else {
+      CalculatePF(Res);
+    }
   }
 
   // If we're updating CF, we need it to be inverted because SubNZCV is inverted
@@ -473,17 +474,18 @@ Ref OpDispatchBuilder::CalculateFlags_ADD(IR::OpSize SrcSize, Ref Src1, Ref Src2
     // As in CalculateFlags_SUB: the add-to-subtract rewrite changes AF.
     Res = APFLG() ? _AddWithFlags(SrcSize, Src1, Src2) : AddWithFlags(SrcSize, Src1, Src2);
     CalculatePFAFFromHost(Res);
-  } else if (APFLG()) {
-    // As in CalculateFlags_SUB.
-    auto Shift = _InlineConstant(32 - IR::OpSizeAsBits(SrcSize));
-    _AddNZCV(OpSize::i32Bit, _Lshl(OpSize::i32Bit, Src1, Shift), _Lshl(OpSize::i32Bit, Src2, Shift));
-    _APFLGFromCompare(Src1, Src2, true);
-    Res = Add(OpSize::i32Bit, Src1, Src2);
-    CalculatePFAFFromHost(Res);
   } else {
     _AddNZCV(SrcSize, Src1, Src2);
+    if (APFLG()) {
+      // As in CalculateFlags_SUB.
+      _APFLGFromCompare(Src1, Src2, true);
+    }
     Res = Add(OpSize::i32Bit, Src1, Src2);
-    CalculatePF(Res);
+    if (APFLG()) {
+      CalculatePFAFFromHost(Res);
+    } else {
+      CalculatePF(Res);
+    }
   }
 
   // We stomped over CF while calculation flags, restore it.
