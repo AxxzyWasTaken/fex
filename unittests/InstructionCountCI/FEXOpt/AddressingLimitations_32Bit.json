@@ -319,11 +319,10 @@
         "mov ebx, gs:0x14"
       ],
       "x86InstructionCount": 2,
-      "ExpectedInstructionCount": 4,
+      "ExpectedInstructionCount": 3,
       "ExpectedArm64ASM": [
         "ldr w20, [x28, #992]",
         "ldr w4, [x20, #256]",
-        "ldr w20, [x28, #992]",
         "ldr w6, [x20, #20]"
       ]
     }

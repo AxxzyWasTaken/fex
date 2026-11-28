@@ -427,7 +427,12 @@ void OpDispatchBuilder::POPOp(OpcodeArgs) {
     ((Dest.IsGPRIndirect() || Dest.IsGPRIndirectRelocation()) && Dest.Data.GPRIndirect.GPR == X86State::REG_RSP) ||
     ((Dest.IsSIB() || Dest.IsSIBRelocation()) && Dest.Data.SIB.Base == X86State::REG_RSP);
   if (RSPBase) {
+    if (!A.Base && A.BaseGPR != AddressMode::InvalidGPR) {
+      A.Base = LoadGPRRegister(A.BaseGPR, GPRSize);
+      A.BaseGPR = AddressMode::InvalidGPR;
+    }
     A.Base = Add(GPRSize, A.Base, IR::OpSizeToSize(Size));
+    A.Cacheable = false;
   }
   _StoreMemAutoTSO(RegClass::GPR, Size, A, Value, Size);
 
@@ -3096,9 +3101,12 @@ void OpDispatchBuilder::WriteSegmentReg(OpcodeArgs, OpDispatchBuilder::Segment S
   Ref Src = LoadSourceGPR(Op, Op->Src[0], Op->Flags);
   if (Seg == Segment::FS) {
     _StoreContextGPR(Size, Src, offsetof(FEXCore::Core::CPUState, fs_cached));
+    InvalidateReg(FSBaseIndex);
   } else {
     _StoreContextGPR(Size, Src, offsetof(FEXCore::Core::CPUState, gs_cached));
+    InvalidateReg(GSBaseIndex);
   }
+  AddrCache.InvalidateSegments();
 }
 
 void OpDispatchBuilder::EnterOp(OpcodeArgs) {
@@ -4248,9 +4256,9 @@ Ref OpDispatchBuilder::GetSegment(uint32_t Flags, uint32_t DefaultPrefix, bool O
 
   if (Is64BitMode) {
     if (Prefix == FEXCore::X86Tables::DecodeFlags::FLAG_FS_PREFIX) {
-      return _LoadContextGPR(GPRSize, offsetof(FEXCore::Core::CPUState, fs_cached));
+      return LoadContext(GPRSize, FSBaseIndex);
     } else if (Prefix == FEXCore::X86Tables::DecodeFlags::FLAG_GS_PREFIX) {
-      return _LoadContextGPR(GPRSize, offsetof(FEXCore::Core::CPUState, gs_cached));
+      return LoadContext(GPRSize, GSBaseIndex);
     }
     // If there was any other segment in 64bit then it is ignored
   } else {
@@ -4276,12 +4284,8 @@ Ref OpDispatchBuilder::GetSegment(uint32_t Flags, uint32_t DefaultPrefix, bool O
     case FEXCore::X86Tables::DecodeFlags::FLAG_DS_PREFIX:
       SegmentResult = _LoadContextGPR(GPRSize, offsetof(FEXCore::Core::CPUState, ds_cached));
       break;
-    case FEXCore::X86Tables::DecodeFlags::FLAG_FS_PREFIX:
-      SegmentResult = _LoadContextGPR(GPRSize, offsetof(FEXCore::Core::CPUState, fs_cached));
-      break;
-    case FEXCore::X86Tables::DecodeFlags::FLAG_GS_PREFIX:
-      SegmentResult = _LoadContextGPR(GPRSize, offsetof(FEXCore::Core::CPUState, gs_cached));
-      break;
+    case FEXCore::X86Tables::DecodeFlags::FLAG_FS_PREFIX: SegmentResult = LoadContext(GPRSize, FSBaseIndex); break;
+    case FEXCore::X86Tables::DecodeFlags::FLAG_GS_PREFIX: SegmentResult = LoadContext(GPRSize, GSBaseIndex); break;
     default: FEX_UNREACHABLE;
     }
 
@@ -4418,12 +4422,15 @@ void OpDispatchBuilder::UpdatePrefixFromSegment(Ref Segment, uint32_t SegmentReg
     break;
   case FEXCore::X86Tables::DecodeFlags::FLAG_FS_PREFIX:
     _StoreContextGPR(OpSize::i32Bit, NewSegment, offsetof(FEXCore::Core::CPUState, fs_cached));
+    InvalidateReg(FSBaseIndex);
     break;
   case FEXCore::X86Tables::DecodeFlags::FLAG_GS_PREFIX:
     _StoreContextGPR(OpSize::i32Bit, NewSegment, offsetof(FEXCore::Core::CPUState, gs_cached));
+    InvalidateReg(GSBaseIndex);
     break;
   default: break; // Do nothing
   }
+  AddrCache.InvalidateSegments();
 }
 
 uint64_t OpDispatchBuilder::CalcAddress(const X86Tables::DecodedOp& Op, const X86Tables::DecodedOperand& Operand, bool IsLoad) {
@@ -4517,11 +4524,16 @@ uint64_t OpDispatchBuilder::CalcAddress(const X86Tables::DecodedOp& Op, const X8
 AddressMode OpDispatchBuilder::DecodeAddress(const X86Tables::DecodedOp& Op, const X86Tables::DecodedOperand& Operand,
                                              MemoryAccessType AccessType, bool IsLoad) {
   const auto GPRSize = GetGPROpSize();
+  const uint32_t Prefix = Op->Flags & FEXCore::X86Tables::DecodeFlags::FLAG_SEGMENTS;
 
   AddressMode A {};
   A.Segment = GetSegment(Op->Flags);
+  A.SegmentPrefix = A.Segment ? static_cast<uint8_t>(Prefix >> 11) : 0;
   A.AddrSize = (Op->Flags & X86Tables::DecodeFlags::FLAG_ADDRESS_SIZE) != 0 ? (GPRSize >> 1) : GPRSize;
   A.NonTSO = AccessType == MemoryAccessType::NONTSO || AccessType == MemoryAccessType::STREAM;
+
+  const bool SegCacheable = (A.Segment == nullptr) || (Prefix == FEXCore::X86Tables::DecodeFlags::FLAG_FS_PREFIX) ||
+                            (Prefix == FEXCore::X86Tables::DecodeFlags::FLAG_GS_PREFIX);
 
   if (Operand.IsLiteral()) {
     A.Offset = Operand.Literal();
@@ -4535,19 +4547,30 @@ AddressMode OpDispatchBuilder::DecodeAddress(const X86Tables::DecodedOp& Op, con
     // Not an address, let the caller deal with it
     A.AddrSize = GPRSize;
   } else if (Operand.IsGPRDirect()) {
-    A.Base = LoadGPRRegister(Operand.Data.GPR.GPR, GPRSize);
+    if (A.Segment && SegCacheable) {
+      A.BaseGPR = Operand.Data.GPR.GPR;
+      A.Cacheable = true;
+    } else {
+      A.Base = LoadGPRRegister(Operand.Data.GPR.GPR, GPRSize);
+    }
     A.NonTSO |= IsNonTSOReg(AccessType, Operand.Data.GPR.GPR);
   } else if (Operand.IsGPRIndirect() || Operand.IsGPRIndirectRelocation()) {
-    A.Base = LoadGPRRegister(Operand.Data.GPRIndirect.GPR, GPRSize);
-    if (Operand.IsGPRIndirectRelocation()) {
-      A.Base = Add(GPRSize, _EntrypointOffset(GPRSize, Operand.Data.GPRIndirect.Displacement), A.Base);
+    if (Operand.IsGPRIndirect() && !Operand.Data.GPRIndirect.PatchableDisp && A.Segment && SegCacheable) {
+      A.BaseGPR = Operand.Data.GPRIndirect.GPR;
+      A.Offset = static_cast<int32_t>(Operand.Data.GPRIndirect.Displacement);
+      A.Cacheable = true;
     } else {
-      if (Operand.Data.GPRIndirect.PatchableDisp) {
-        A.Base = Add(GPRSize, A.Base,
-                     _PatchableGuestData(OpSize::i64Bit, static_cast<int32_t>(Operand.Data.GPRIndirect.Displacement),
-                                         Op->PC + Operand.Data.GPRIndirect.DispOffset, 4));
+      A.Base = LoadGPRRegister(Operand.Data.GPRIndirect.GPR, GPRSize);
+      if (Operand.IsGPRIndirectRelocation()) {
+        A.Base = Add(GPRSize, _EntrypointOffset(GPRSize, Operand.Data.GPRIndirect.Displacement), A.Base);
       } else {
-        A.Offset = static_cast<int32_t>(Operand.Data.GPRIndirect.Displacement);
+        if (Operand.Data.GPRIndirect.PatchableDisp) {
+          A.Base = Add(GPRSize, A.Base,
+                       _PatchableGuestData(OpSize::i64Bit, static_cast<int32_t>(Operand.Data.GPRIndirect.Displacement),
+                                           Op->PC + Operand.Data.GPRIndirect.DispOffset, 4));
+        } else {
+          A.Offset = static_cast<int32_t>(Operand.Data.GPRIndirect.Displacement);
+        }
       }
     }
     A.NonTSO |= IsNonTSOReg(AccessType, Operand.Data.GPRIndirect.GPR);
@@ -4569,42 +4592,53 @@ AddressMode OpDispatchBuilder::DecodeAddress(const X86Tables::DecodedOp& Op, con
     }
   } else if (Operand.IsSIB() || Operand.IsSIBRelocation()) {
     const bool IsVSIB = IsLoad && ((Op->Flags & X86Tables::DecodeFlags::FLAG_VSIB_BYTE) != 0);
+    const bool CanCacheSIB = Operand.IsSIB() && !Operand.Data.SIB.PatchableDisp && !IsVSIB && SegCacheable;
 
-    if (Operand.Data.SIB.Base != FEXCore::X86State::REG_INVALID) {
-      A.Base = LoadGPRRegister(Operand.Data.SIB.Base, GPRSize);
-    }
-
-    // NOTE: VSIB cannot have the index * scale portion calculated ahead of time,
-    //       since the index in this case is a vector. So, we can't just apply the scale
-    //       to it, since this needs to be applied to each element in the index register
-    //       after said element has been sign extended. So, we pass this through for the
-    //       instruction implementation to handle.
-    //
-    //       What we do handle though, is the applying the displacement value to
-    //       the base register (if a base register is provided), since this is a
-    //       part of the address calculation that can be done ahead of time.
-    if (!IsVSIB && Operand.Data.SIB.Index != FEXCore::X86State::REG_INVALID) {
-      A.Index = LoadGPRRegister(Operand.Data.SIB.Index, GPRSize);
-      A.IndexScale = Operand.Data.SIB.Scale;
-    }
-
-    if (Operand.IsSIBRelocation()) {
-      auto EPOffset = _EntrypointOffset(GPRSize, Operand.Data.SIB.Offset);
-      if (A.Base) {
-        A.Base = Add(GPRSize, EPOffset, A.Base);
-      } else {
-        A.Base = EPOffset;
+    if (CanCacheSIB) {
+      A.BaseGPR = Operand.Data.SIB.Base;
+      if (Operand.Data.SIB.Index != FEXCore::X86State::REG_INVALID) {
+        A.IndexGPR = Operand.Data.SIB.Index;
+        A.IndexScale = Operand.Data.SIB.Scale;
       }
-    } else if (Operand.Data.SIB.PatchableDisp) {
-      Ref PatchedDisp =
-        _PatchableGuestData(OpSize::i64Bit, static_cast<int32_t>(Operand.Data.SIB.Offset), Op->PC + Operand.Data.SIB.DispOffset, 4);
-      if (A.Base) {
-        A.Base = Add(OpSize::i64Bit, A.Base, PatchedDisp);
-      } else {
-        A.Base = PatchedDisp;
-      }
-    } else {
       A.Offset = static_cast<int32_t>(Operand.Data.SIB.Offset);
+      A.Cacheable = true;
+    } else {
+      if (Operand.Data.SIB.Base != FEXCore::X86State::REG_INVALID) {
+        A.Base = LoadGPRRegister(Operand.Data.SIB.Base, GPRSize);
+      }
+
+      // NOTE: VSIB cannot have the index * scale portion calculated ahead of time,
+      //       since the index in this case is a vector. So, we can't just apply the scale
+      //       to it, since this needs to be applied to each element in the index register
+      //       after said element has been sign extended. So, we pass this through for the
+      //       instruction implementation to handle.
+      //
+      //       What we do handle though, is the applying the displacement value to
+      //       the base register (if a base register is provided), since this is a
+      //       part of the address calculation that can be done ahead of time.
+      if (!IsVSIB && Operand.Data.SIB.Index != FEXCore::X86State::REG_INVALID) {
+        A.Index = LoadGPRRegister(Operand.Data.SIB.Index, GPRSize);
+        A.IndexScale = Operand.Data.SIB.Scale;
+      }
+
+      if (Operand.IsSIBRelocation()) {
+        auto EPOffset = _EntrypointOffset(GPRSize, Operand.Data.SIB.Offset);
+        if (A.Base) {
+          A.Base = Add(GPRSize, EPOffset, A.Base);
+        } else {
+          A.Base = EPOffset;
+        }
+      } else if (Operand.Data.SIB.PatchableDisp) {
+        Ref PatchedDisp =
+          _PatchableGuestData(OpSize::i64Bit, static_cast<int32_t>(Operand.Data.SIB.Offset), Op->PC + Operand.Data.SIB.DispOffset, 4);
+        if (A.Base) {
+          A.Base = Add(OpSize::i64Bit, A.Base, PatchedDisp);
+        } else {
+          A.Base = PatchedDisp;
+        }
+      } else {
+        A.Offset = static_cast<int32_t>(Operand.Data.SIB.Offset);
+      }
     }
 
     A.NonTSO |= IsNonTSOReg(AccessType, Operand.Data.SIB.Base) || IsNonTSOReg(AccessType, Operand.Data.SIB.Index);
@@ -4659,7 +4693,7 @@ Ref OpDispatchBuilder::LoadSource_WithOpSize(RegClass Class, const X86Tables::De
   const bool ShouldLoad = (IsOperandMem(Operand, true) && LoadData) || ForceLoad;
   if (ShouldLoad) {
     if (OpSize == OpSize::f80Bit) {
-      Ref MemSrc = LoadEffectiveAddress(this, A, GetGPROpSize(), true);
+      Ref MemSrc = LoadEffectiveAddressCached(A, GetGPROpSize(), true);
       if (CTX->HostFeatures.SupportsSVE()) {
         Result = _LoadMemX87SVEOptPredicate(OpSize::i128Bit, OpSize::i16Bit, MemSrc);
       } else {
@@ -4671,7 +4705,7 @@ Ref OpDispatchBuilder::LoadSource_WithOpSize(RegClass Class, const X86Tables::De
       Result = _LoadMemAutoTSO(Class, OpSize, A, Align == OpSize::iInvalid ? OpSize : Align);
     }
   } else {
-    Result = LoadEffectiveAddress(this, A, GetGPROpSize(), false, AllowUpperGarbage);
+    Result = LoadEffectiveAddressCached(A, GetGPROpSize(), false, AllowUpperGarbage);
   }
 
   if constexpr (Context::BLOCK_DEBUGGING) {
@@ -4798,7 +4832,7 @@ void OpDispatchBuilder::StoreResult_WithOpSize(RegClass Class, FEXCore::X86Table
   AddressMode A = DecodeAddress(Op, Operand, AccessType, false /* IsLoad */);
 
   if (OpSize == OpSize::f80Bit) {
-    Ref MemStoreDst = LoadEffectiveAddress(this, A, GetGPROpSize(), true);
+    Ref MemStoreDst = LoadEffectiveAddressCached(A, GetGPROpSize(), true);
     if (CTX->HostFeatures.SupportsSVE()) {
       _StoreMemX87SVEOptPredicate(OpSize::i128Bit, OpSize::i16Bit, Src, MemStoreDst);
     } else {
@@ -4856,6 +4890,9 @@ void OpDispatchBuilder::ResetWorkingList() {
   CurrentCodeBlock = nullptr;
   RegCache.Written = 0;
   RegCache.Cached = 0;
+  RegCache.Partial = 0;
+  RegCache.Index = 0;
+  AddrCache.Reset();
 }
 
 void OpDispatchBuilder::UnhandledOp(OpcodeArgs) {

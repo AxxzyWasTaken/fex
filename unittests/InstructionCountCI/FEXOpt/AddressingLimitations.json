@@ -1047,11 +1047,10 @@
         "mov rbx, gs:0x14"
       ],
       "x86InstructionCount": 2,
-      "ExpectedInstructionCount": 4,
+      "ExpectedInstructionCount": 3,
       "ExpectedArm64ASM": [
         "ldr x20, [x28, #992]",
         "ldr x4, [x20, #256]",
-        "ldr x20, [x28, #992]",
         "ldur x6, [x20, #20]"
       ]
     },
@@ -1133,6 +1132,92 @@
         "ldr q2, [x28, #208]",
         "add x20, x7, x10",
         "stp q17, q2, [x20, #-976]"
+      ]
+    },
+    "Multiple FS segment registers": {
+      "x86Insts": [
+        "mov rax, fs:0x100",
+        "mov rbx, fs:0x14"
+      ],
+      "x86InstructionCount": 2,
+      "ExpectedInstructionCount": 3,
+      "ExpectedArm64ASM": [
+        "ldr x20, [x28, #984]",
+        "ldr x4, [x20, #256]",
+        "ldur x6, [x20, #20]"
+      ]
+    },
+    "FS segment register invalidated by wrfsbase": {
+      "x86Insts": [
+        "mov rax, fs:0x10",
+        "wrfsbase rcx",
+        "mov rbx, fs:0x18"
+      ],
+      "x86InstructionCount": 3,
+      "ExpectedInstructionCount": 5,
+      "ExpectedArm64ASM": [
+        "ldr x20, [x28, #984]",
+        "ldr x4, [x20, #16]",
+        "str x7, [x28, #984]",
+        "ldr x20, [x28, #984]",
+        "ldr x6, [x20, #24]"
+      ]
+    },
+    "SIB base+index reuse across offsets": {
+      "x86Insts": [
+        "mov eax, [rbx+rcx*4+0x8]",
+        "mov edx, [rbx+rcx*4+0x10]",
+        "mov esi, [rbx+rcx*4+0x18]"
+      ],
+      "x86InstructionCount": 3,
+      "ExpectedInstructionCount": 4,
+      "ExpectedArm64ASM": [
+        "add x20, x6, x7, lsl #2",
+        "ldr w4, [x20, #8]",
+        "ldr w5, [x20, #16]",
+        "ldr w10, [x20, #24]"
+      ]
+    },
+    "SIB base+index invalidated by partial clobber": {
+      "x86Insts": [
+        "mov eax, [rbx+rcx*4+0x8]",
+        "add cl, 1",
+        "mov edx, [rbx+rcx*4+0x10]"
+      ],
+      "x86InstructionCount": 3,
+      "ExpectedInstructionCount": 13,
+      "ExpectedArm64ASM": [
+        "add x20, x6, x7, lsl #2",
+        "ldr w4, [x20, #8]",
+        "mov w20, #0x1",
+        "lsl w0, w7, #24",
+        "cmn w0, w20, lsl #24",
+        "add w26, w7, #0x1 (1)",
+        "mov x20, x7",
+        "bfxil x20, x26, #0, #8",
+        "mov x27, x7",
+        "mov x7, x20",
+        "add x20, x6, x7, lsl #2",
+        "ldr w5, [x20, #16]",
+        "cfinv"
+      ]
+    },
+    "SIB 32-bit addr override not folded with offset": {
+      "x86Insts": [
+        "mov eax, [ebx+ecx*4+0x8]",
+        "mov edx, [ebx+ecx*4+0x10]"
+      ],
+      "x86InstructionCount": 2,
+      "ExpectedInstructionCount": 8,
+      "ExpectedArm64ASM": [
+        "add x20, x6, #0x8 (8)",
+        "add x20, x20, x7, lsl #2",
+        "mov w20, w20",
+        "ldr w4, [x20]",
+        "add x20, x6, #0x10 (16)",
+        "add x20, x20, x7, lsl #2",
+        "mov w20, w20",
+        "ldr w5, [x20]"
       ]
     }
   }

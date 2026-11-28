@@ -1221,6 +1221,7 @@ public:
         DefIndex = 0;
       }
       RegCache.Index = 0;
+      AddrCache.Reset();
     }
 
     if (!MMXOnly) {
@@ -2104,7 +2105,9 @@ private:
   /* Note this range is only valid if MMXState = MMXState_MMX */
   static const int MM0Index = 20;
   static const int MM7Index = 27;
-  /* Gap 28..30 */
+  static const int FSBaseIndex = 28;
+  static const int GSBaseIndex = 29;
+  /* Gap 30 */
   static const int DFIndex = 31;
   static const int FPR0Index = 32;
   static const int FPR15Index = 47;
@@ -2115,6 +2118,8 @@ private:
   static uint32_t CacheIndexToContextOffset(int Index) {
     switch (Index) {
     case MM0Index ... MM7Index: return ARRAY_OFFSETOF(FEXCore::Core::CPUState, mm, Index - MM0Index);
+    case FSBaseIndex: return offsetof(FEXCore::Core::CPUState, fs_cached);
+    case GSBaseIndex: return offsetof(FEXCore::Core::CPUState, gs_cached);
     case AVXHigh0Index ... AVXHigh15Index: return ARRAY_OFFSETOF(FEXCore::Core::CPUState, avx_high, Index - AVXHigh0Index);
     default: return ~0U;
     }
@@ -2163,11 +2168,40 @@ private:
     uint32_t Index;
   } RegCache {};
 
+  AddrBaseCache AddrCache {};
+
+  static Ref MaterializeGPRForAddress(void* Ctx, uint8_t GPR, IR::OpSize GPRSize) {
+    return static_cast<OpDispatchBuilder*>(Ctx)->LoadGPRRegister(GPR, GPRSize);
+  }
+
+  AddrCacheContext MakeAddrCacheContext() {
+    return {
+      .Cache = &AddrCache,
+      .InstIndex = RegCache.Index,
+      .LoadGPR = &OpDispatchBuilder::MaterializeGPRForAddress,
+      .Ctx = this,
+    };
+  }
+
+  Ref LoadEffectiveAddressCached(const AddressMode& A, IR::OpSize GPRSize, bool AddSegmentBase, bool AllowUpperGarbage = false) {
+    const auto CacheCtx = MakeAddrCacheContext();
+    return LoadEffectiveAddress(this, A, GPRSize, AddSegmentBase, AllowUpperGarbage, &CacheCtx);
+  }
+
+  AddressMode SelectAddressModeCached(const AddressMode& A, IR::OpSize GPRSize, bool HostSupportsTSOImm9, bool AtomicTSO, bool Vector,
+                                      IR::OpSize AccessSize) {
+    const auto CacheCtx = MakeAddrCacheContext();
+    return SelectAddressMode(this, A, GPRSize, HostSupportsTSOImm9, AtomicTSO, Vector, AccessSize, &CacheCtx);
+  }
+
   void InvalidateReg(uint8_t Index) {
     uint64_t Bit = (1ull << (uint64_t)Index);
     RegCache.Cached &= ~Bit;
     RegCache.Written &= ~Bit;
     RegCache.LastDef[Index] = nullptr;
+    if (Index >= GPR0Index && Index <= GPR15Index) {
+      AddrCache.InvalidateGPR(Index - GPR0Index);
+    }
   }
 
   Ref LoadRegCache(uint64_t Offset, uint8_t Index, RegClass Class, IR::OpSize Size) {
@@ -2190,6 +2224,8 @@ private:
     if (!(RegCache.Cached & Bit)) {
       if (Index == DFIndex) {
         RegCache.Value[Index] = _LoadDF();
+      } else if (Index == FSBaseIndex || Index == GSBaseIndex) {
+        RegCache.Value[Index] = _LoadContext(Size, Class, Offset);
       } else if ((Index >= MM0Index && Index <= MM7Index) || Index >= AVXHigh0Index) {
         RegCache.Value[Index] = _LoadContext(Size, Class, Offset);
 
@@ -2226,7 +2262,7 @@ private:
   }
 
   RefPair LoadRegCachePair(uint64_t Offset, uint8_t Index, RegClass Class, IR::OpSize Size) {
-    LOGMAN_THROW_A_FMT(Index != DFIndex, "must be pairable");
+    LOGMAN_THROW_A_FMT(Index != DFIndex && Index != FSBaseIndex && Index != GSBaseIndex, "must be pairable");
     LOGMAN_THROW_A_FMT(Size != IR::OpSize::iUnsized, "Invalid size!");
 
     // Try to load a pair into the cache
@@ -2287,6 +2323,9 @@ private:
     RegCache.PrevDefIndex[Index] = RegCache.LastDefIndex[Index];
     RegCache.LastDef[Index] = Value;
     RegCache.LastDefIndex[Index] = RegCache.Index;
+    if (Index >= GPR0Index && Index <= GPR15Index) {
+      AddrCache.InvalidateGPR(Index - GPR0Index);
+    }
   }
 
   void InvalidateHighAVXRegisters() {
@@ -2743,7 +2782,7 @@ private:
 
   Ref _LoadMemAutoTSO(RegClass Class, OpSize Size, const AddressMode& A, OpSize Align = OpSize::i8Bit) {
     const bool AtomicTSO = IsTSOEnabled(Class) && !A.NonTSO;
-    const auto B = SelectAddressMode(this, A, GetGPROpSize(), CTX->HostFeatures.SupportsTSOImm9, AtomicTSO, Class != RegClass::GPR, Size);
+    const auto B = SelectAddressModeCached(A, GetGPROpSize(), CTX->HostFeatures.SupportsTSOImm9, AtomicTSO, Class != RegClass::GPR, Size);
 
     if (AtomicTSO) {
       return _LoadMemTSO(Class, Size, B.Base, B.Index, Align, B.IndexType, B.IndexScale);
@@ -2769,7 +2808,7 @@ private:
       A.Offset = 0;
     }
 
-    Out.Base = LoadEffectiveAddress(this, A, GetGPROpSize(), true, false);
+    Out.Base = LoadEffectiveAddressCached(A, GetGPROpSize(), true, false);
     return Out;
   }
 
@@ -2806,7 +2845,7 @@ private:
 
   Ref _StoreMemAutoTSO(RegClass Class, OpSize Size, const AddressMode& A, Ref Value, OpSize Align = OpSize::i8Bit) {
     const bool AtomicTSO = IsTSOEnabled(Class) && !A.NonTSO;
-    const auto B = SelectAddressMode(this, A, GetGPROpSize(), CTX->HostFeatures.SupportsTSOImm9, AtomicTSO, Class != RegClass::GPR, Size);
+    const auto B = SelectAddressModeCached(A, GetGPROpSize(), CTX->HostFeatures.SupportsTSOImm9, AtomicTSO, Class != RegClass::GPR, Size);
 
     if (AtomicTSO) {
       return _StoreMemTSO(Class, Size, Value, B.Base, B.Index, Align, B.IndexType, B.IndexScale);
