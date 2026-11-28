@@ -71,7 +71,9 @@ public:
 
   // Protect: write-protect each page the block decodes from before reading it, for blocks whose pages get added to the
   // lookup cache.
-  void SetupDecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thread, uint64_t PC, uint64_t MaxInst, bool Protect = false);
+  // IsFileBacked: true when the entry resides in a file-backed executable mapping rather than anonymous JIT memory.
+  void SetupDecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thread, uint64_t PC, uint64_t MaxInst, bool Protect = false,
+                                      bool IsFileBacked = false);
   void DecodeLoop(const uint8_t* InstStream, uint64_t GuestPause = 0);
 
   const DecodedBlockInformation* GetDecodedBlockInfo() const {
@@ -152,6 +154,7 @@ private:
   uint64_t CurrentCodePage {~0ULL};
   uint64_t LastRecordedCodePage {~0ULL};
   bool ProtectCodePages {};
+  bool IsFileBacked {};
   fextl::set<uint64_t> ProtectedCodePages;
   bool EntryBlock {};
   bool FinalInstruction {};

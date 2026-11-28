@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 #include "Interface/Core/ArchHelpers/Arm64Emitter.h"
 #include "Interface/Core/Dispatcher/Dispatcher.h"
+#include "Interface/Core/JIT/Relocations.h"
 #include "Interface/Context/Context.h"
 
 #include <FEXCore/Core/CoreState.h>
@@ -595,6 +596,116 @@ void Arm64Emitter::LoadConstant(ARMEmitter::Size s, ARMEmitter::Register Reg, ui
       nop();
     }
   }
+}
+
+namespace {
+  std::pair<uint8_t, uint8_t> CountConstantChunks(uint64_t Value) {
+    uint8_t NonZero = 0;
+    uint8_t NonOnes = 0;
+    for (int i = 0; i < 4; ++i) {
+      const uint16_t Part = static_cast<uint16_t>(Value >> (i * 16));
+      if (Part != 0) {
+        ++NonZero;
+      }
+      if (Part != 0xFFFF) {
+        ++NonOnes;
+      }
+    }
+    return {NonZero, NonOnes};
+  }
+} // namespace
+
+bool Arm64Emitter::CanLoadPatchableConstant(uint64_t Value, uint8_t MaxInsns) {
+  if (MaxInsns < 1 || MaxInsns > 4) {
+    return false;
+  }
+  if (MaxInsns == 4) {
+    return true;
+  }
+  const auto [NonZero, NonOnes] = CountConstantChunks(Value);
+  if (std::min(NonZero, NonOnes) <= MaxInsns) {
+    return true;
+  }
+  return ARMEmitter::Emitter::IsImmLogical(Value, 64);
+}
+
+uint8_t Arm64Emitter::GetPatchableMoveInsns(RelocationTypes Type, uint8_t ValueSize) {
+  switch (Type) {
+  case RelocationTypes::RELOC_GUEST_PATCHABLE_DATA_MOVE:
+    if (ValueSize <= 2) {
+      return 1;
+    }
+    if (ValueSize == 4) {
+      return 2;
+    }
+    return 4;
+  case RelocationTypes::RELOC_GUEST_PATCHABLE_CRC_MOVE: return 2;
+  case RelocationTypes::RELOC_GUEST_PATCHABLE_RIP_MOVE: return 3;
+  default: ERROR_AND_DIE_FMT("Unexpected patchable move relocation type: {}", ToUnderlying(Type));
+  }
+}
+
+uint64_t Arm64Emitter::SignExtendPatchableData(uint64_t Value, uint8_t ValueSize) {
+  switch (ValueSize) {
+  case 1: return static_cast<uint64_t>(static_cast<int64_t>(static_cast<int8_t>(Value)));
+  case 2: return static_cast<uint64_t>(static_cast<int64_t>(static_cast<int16_t>(Value)));
+  case 4: return static_cast<uint64_t>(static_cast<int64_t>(static_cast<int32_t>(Value)));
+  default: return Value;
+  }
+}
+
+void Arm64Emitter::LoadPatchableConstant(ARMEmitter::Register Reg, uint64_t Value, uint8_t MaxInsns) {
+  LOGMAN_THROW_A_FMT(MaxInsns >= 1 && MaxInsns <= 4, "LoadPatchableConstant MaxInsns={} out of range [1, 4]", MaxInsns);
+
+  const auto StartOffset = GetCursorOffset();
+  const auto [NonZero, NonOnes] = CountConstantChunks(Value);
+  uint8_t Emitted = 0;
+
+  if (NonZero == 0) {
+    movz(ARMEmitter::Size::i64Bit, Reg, 0);
+    Emitted = 1;
+  } else if (NonOnes == 0) {
+    movn(ARMEmitter::Size::i64Bit, Reg, 0);
+    Emitted = 1;
+  } else if (std::min(NonZero, NonOnes) > 1 && ARMEmitter::Emitter::IsImmLogical(Value, 64)) {
+    orr(ARMEmitter::Size::i64Bit, Reg, ARMEmitter::Reg::zr, Value);
+    Emitted = 1;
+  } else if (NonZero <= NonOnes) {
+    LOGMAN_THROW_A_FMT(NonZero <= MaxInsns, "LoadPatchableConstant {:#x} needs {} movz/movk > MaxInsns={}", Value, NonZero, MaxInsns);
+    for (int i = 0; i < 4; ++i) {
+      const uint16_t Part = static_cast<uint16_t>(Value >> (i * 16));
+      if (Part != 0) {
+        if (Emitted == 0) {
+          movz(ARMEmitter::Size::i64Bit, Reg, Part, i * 16);
+        } else {
+          movk(ARMEmitter::Size::i64Bit, Reg, Part, i * 16);
+        }
+        ++Emitted;
+      }
+    }
+  } else {
+    LOGMAN_THROW_A_FMT(NonOnes <= MaxInsns, "LoadPatchableConstant {:#x} needs {} movn/movk > MaxInsns={}", Value, NonOnes, MaxInsns);
+    for (int i = 0; i < 4; ++i) {
+      const uint16_t Part = static_cast<uint16_t>(Value >> (i * 16));
+      if (Part != 0xFFFF) {
+        if (Emitted == 0) {
+          movn(ARMEmitter::Size::i64Bit, Reg, static_cast<uint16_t>(~Part), i * 16);
+        } else {
+          movk(ARMEmitter::Size::i64Bit, Reg, Part, i * 16);
+        }
+        ++Emitted;
+      }
+    }
+  }
+
+  for (uint8_t i = Emitted; i < MaxInsns; ++i) {
+    nop();
+  }
+
+  const auto EndOffset = GetCursorOffset();
+  LOGMAN_THROW_A_FMT(EndOffset - StartOffset == static_cast<size_t>(MaxInsns) * 4,
+                     "LoadPatchableConstant emitted {} bytes, expected {} (Value={:#x}, MaxInsns={})", EndOffset - StartOffset,
+                     static_cast<size_t>(MaxInsns) * 4, Value, MaxInsns);
 }
 
 void Arm64Emitter::PushCalleeSavedRegisters() {

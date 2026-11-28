@@ -966,9 +966,9 @@ uintptr_t ContextImpl::CompileBlockLocked(FEXCore::Core::CpuStateFrame* Frame, u
     return HostCode;
   }
 
-  Thread->FrontendDecoder->SetupDecodeInstructionsAtEntry(Thread, GuestRIP, MaxInst, true);
-
   std::optional<ExecutableFileSectionInfo> Region = SyscallHandler->LookupExecutableFileSection(Thread, GuestRIP);
+  const bool IsFileBacked = Region && Region->FileStartVA != 0;
+  Thread->FrontendDecoder->SetupDecodeInstructionsAtEntry(Thread, GuestRIP, MaxInst, true, IsFileBacked);
   std::optional<DiskCache::CodeHitData> Hit;
   std::optional<uint64_t> DiskCacheGuestCodeKey;
   {

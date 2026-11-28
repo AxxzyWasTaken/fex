@@ -1486,8 +1486,8 @@ bool Decoder::CheckIfCacheable(FEXCore::Core::InternalThreadState& Thread, const
 void Decoder::DetectDataMasks(uint64_t OpAddress, DecodedBlocks& Block) {
   FEXCore::X86Tables::DecodedOperand* LiteralToPatch = nullptr;
 
-  // cmp *, imm8 - seen varying in mono jitted code
-  {
+  // cmp *, imm8 - seen varying in mono jitted code (anonymous mappings only)
+  if (!IsFileBacked) {
     FEXCore::X86Tables::ModRMDecoded ModRM;
     ModRM.Hex = DecodeInst->ModRM;
     if ((DecodeInst->OPRaw == 0x80 || DecodeInst->OPRaw == 0x83) && ModRM.reg == 7 && LastFieldReadSize == 1) {
@@ -1525,12 +1525,17 @@ void Decoder::DetectDataMasks(uint64_t OpAddress, DecodedBlocks& Block) {
       LiteralToPatch = &DecodeInst->Dest;
     }
 
-    // heuristic: if it's a small value, assume it's more likely to be part of the code around it
-    bool IsMOV = (DecodeInst->OPRaw >= 0xB8 && DecodeInst->OPRaw <= 0xBF) || DecodeInst->OPRaw == 0xC7;
-    if (LiteralToPatch && IsMOV && LiteralToPatch->Literal() < 0x10000ULL) {
-      LiteralToPatch = nullptr;
+    // Heuristic: small signed immediates (stack adjustments, masks, counts, sentinels like -1)
+    // are almost always part of the code logic rather than patchable runtime values.
+    if (LiteralToPatch) {
+      constexpr int64_t SmallLiteralThreshold = 0x10000;
+      const int64_t SignedVal = LastFieldReadSize == 4 ? static_cast<int64_t>(static_cast<int32_t>(LiteralToPatch->Literal())) :
+                                                         static_cast<int64_t>(LiteralToPatch->Literal());
+      if (SignedVal > -SmallLiteralThreshold && SignedVal < SmallLiteralThreshold) {
+        LiteralToPatch = nullptr;
+      }
     }
-    if (LiteralToPatch && LiteralToPatch->Literal() != 0) {
+    if (LiteralToPatch) {
       Type = DataMaskType::MOV;
     }
   }
@@ -1560,6 +1565,7 @@ void Decoder::DetectDataMasks(uint64_t OpAddress, DecodedBlocks& Block) {
         OpToPatch = &DecodeInst->Dest;
       }
       if (!FoundLiteral && OpToPatch) {
+        constexpr int32_t SmallDispThreshold = 0x10000;
         if (DecodeInst->TableInfo->OpcodeDispatcher.OpDispatch == &IR::OpDispatchBuilder::NOPOp) {
           // if it's a nop disp, only mask data out, no other action required
           Type = DataMaskType::NOP;
@@ -1568,20 +1574,26 @@ void Decoder::DetectDataMasks(uint64_t OpAddress, DecodedBlocks& Block) {
           OpToPatch->Data.RIPLiteral.PatchableDisp = true;
           OpToPatch->Data.RIPLiteral.DispOffset = LastFieldReadOffset;
         } else if (OpToPatch->IsGPRIndirect()) {
-          // filter out disp8
+          // filter out disp8 and small signed disp32 struct/stack offsets
           if (!(ModRM.mod == 1)) {
-            Type = DataMaskType::DISP;
-            OpToPatch->Data.GPRIndirect.PatchableDisp = true;
-            OpToPatch->Data.GPRIndirect.DispOffset = LastFieldReadOffset;
+            const int32_t Disp = static_cast<int32_t>(OpToPatch->Data.GPRIndirect.Displacement);
+            if (Disp <= -SmallDispThreshold || Disp >= SmallDispThreshold) {
+              Type = DataMaskType::DISP;
+              OpToPatch->Data.GPRIndirect.PatchableDisp = true;
+              OpToPatch->Data.GPRIndirect.DispOffset = LastFieldReadOffset;
+            }
           }
         } else if (OpToPatch->IsSIB()) {
           FEXCore::X86Tables::SIBDecoded SIB;
           SIB.Hex = DecodeInst->SIB;
-          // two disp32 cases here
+          // two disp32 cases here; exempt small signed disp32 struct/stack/TEB offsets
           if (ModRM.mod == 0b10 || (ModRM.mod == 0 && SIB.base == 0b101)) {
-            Type = DataMaskType::DISP;
-            OpToPatch->Data.SIB.PatchableDisp = true;
-            OpToPatch->Data.SIB.DispOffset = LastFieldReadOffset;
+            const int32_t Disp = static_cast<int32_t>(OpToPatch->Data.SIB.Offset);
+            if (Disp <= -SmallDispThreshold || Disp >= SmallDispThreshold) {
+              Type = DataMaskType::DISP;
+              OpToPatch->Data.SIB.PatchableDisp = true;
+              OpToPatch->Data.SIB.DispOffset = LastFieldReadOffset;
+            }
           }
         }
       }
@@ -1888,8 +1900,10 @@ void Decoder::RecordCodePage(uint64_t Page) {
   }
 }
 
-void Decoder::SetupDecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thread, uint64_t PC, uint64_t MaxInst, bool Protect) {
+void Decoder::SetupDecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thread, uint64_t PC, uint64_t MaxInst, bool Protect,
+                                             bool IsFileBacked) {
   FEXCORE_PROFILE_SCOPED("DecodeInstructions");
+  this->IsFileBacked = IsFileBacked;
   BlockInfo.TotalInstructionCount = 0;
   BlockInfo.Blocks.clear();
   VisitedBlocks.clear();

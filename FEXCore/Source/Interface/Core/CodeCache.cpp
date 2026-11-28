@@ -545,22 +545,29 @@ static inline int64_t ReadLiveGuestData(uint64_t SiteAddress, uint8_t ValueSize)
 }
 
 static inline void ApplyPatchableDataRelocation(uint64_t SiteAddress, uint8_t ValueSize, uint8_t RegisterIndex, CPU::Arm64Emitter& Emitter) {
-  Emitter.LoadConstant(ARMEmitter::Size::i64Bit, ARMEmitter::Register(RegisterIndex), ReadLiveGuestData(SiteAddress, ValueSize),
-                       CPU::Arm64Emitter::PadType::DOPAD);
+  const uint64_t Value = static_cast<uint64_t>(ReadLiveGuestData(SiteAddress, ValueSize));
+  const uint8_t MaxInsns = CPU::Arm64Emitter::GetPatchableMoveInsns(CPU::RelocationTypes::RELOC_GUEST_PATCHABLE_DATA_MOVE, ValueSize);
+  Emitter.LoadPatchableConstant(ARMEmitter::Register(RegisterIndex), Value, MaxInsns);
 }
 
 static inline void ApplyPatchableRIPLiteralRelocation(uint64_t SiteAddress, uint8_t ValueSize, CPU::Arm64Emitter& Emitter) {
   Emitter.dc64(SiteAddress + ValueSize + ReadLiveGuestData(SiteAddress, ValueSize));
 }
 
-static inline void ApplyPatchableRIPMoveRelocation(uint64_t SiteAddress, uint8_t ValueSize, uint8_t RegisterIndex, CPU::Arm64Emitter& Emitter) {
+static inline bool ApplyPatchableRIPMoveRelocation(uint64_t SiteAddress, uint8_t ValueSize, uint8_t RegisterIndex, CPU::Arm64Emitter& Emitter) {
   const uint64_t Target = SiteAddress + ValueSize + ReadLiveGuestData(SiteAddress, ValueSize);
-  Emitter.LoadConstant(ARMEmitter::Size::i64Bit, ARMEmitter::Register(RegisterIndex), Target, CPU::Arm64Emitter::PadType::DOPAD);
+  const uint8_t MaxInsns = CPU::Arm64Emitter::GetPatchableMoveInsns(CPU::RelocationTypes::RELOC_GUEST_PATCHABLE_RIP_MOVE, ValueSize);
+  if (!CPU::Arm64Emitter::CanLoadPatchableConstant(Target, MaxInsns)) {
+    return false;
+  }
+  Emitter.LoadPatchableConstant(ARMEmitter::Register(RegisterIndex), Target, MaxInsns);
+  return true;
 }
 
 static inline void ApplyPatchableCRCMoveRelocation(uint64_t SiteAddress, uint8_t ValueSize, uint8_t RegisterIndex, CPU::Arm64Emitter& Emitter) {
   const uint64_t Target = FEXCore::Utils::crc32(reinterpret_cast<const uint8_t*>(SiteAddress), ValueSize);
-  Emitter.LoadConstant(ARMEmitter::Size::i64Bit, ARMEmitter::Register(RegisterIndex), Target, CPU::Arm64Emitter::PadType::DOPAD);
+  const uint8_t MaxInsns = CPU::Arm64Emitter::GetPatchableMoveInsns(CPU::RelocationTypes::RELOC_GUEST_PATCHABLE_CRC_MOVE, ValueSize);
+  Emitter.LoadPatchableConstant(ARMEmitter::Register(RegisterIndex), Target, MaxInsns);
 }
 
 bool CodeCache::ApplyPackedCodeRelocations(uint64_t GuestEntry, std::span<std::byte> Code,
@@ -593,8 +600,10 @@ bool CodeCache::ApplyPackedCodeRelocations(uint64_t GuestEntry, std::span<std::b
       break;
     }
     case FEXCore::CPU::RelocationTypes::RELOC_GUEST_PATCHABLE_RIP_MOVE: {
-      ApplyPatchableRIPMoveRelocation(GuestEntry + Reloc.PatchableData.SiteOffset, Reloc.PatchableData.ValueSize,
-                                      Reloc.PatchableData.RegisterIndex, Emitter);
+      if (!ApplyPatchableRIPMoveRelocation(GuestEntry + Reloc.PatchableData.SiteOffset, Reloc.PatchableData.ValueSize,
+                                           Reloc.PatchableData.RegisterIndex, Emitter)) {
+        return false;
+      }
       break;
     }
     case FEXCore::CPU::RelocationTypes::RELOC_GUEST_PATCHABLE_CRC_MOVE: {

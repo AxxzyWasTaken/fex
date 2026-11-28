@@ -129,8 +129,17 @@ void Arm64JITCore::InsertGuestPatchableMove(FEXCore::CPU::RelocationTypes Type, 
   MoveABI.GuestPatchableData.ValueSize = ValueSize;
   MoveABI.GuestPatchableData.SiteAddress = SiteAddress;
 
-  // this might get patched on disk cache load
-  LoadConstant(ARMEmitter::Size::i64Bit, Reg, Value, FEXCore::CPU::Arm64Emitter::PadType::DOPAD);
+  if (Type == FEXCore::CPU::RelocationTypes::RELOC_GUEST_PATCHABLE_DATA_MOVE) {
+    Value = SignExtendPatchableData(Value, ValueSize);
+  }
+
+  // This might get patched on disk cache load.
+  const uint8_t MaxInsns = GetPatchableMoveInsns(Type, ValueSize);
+  if (!CanLoadPatchableConstant(Value, MaxInsns)) {
+    ERROR_AND_DIE_FMT("InsertGuestPatchableMove value {:#x} (type {}, size {}) exceeds {} patchable insns", Value,
+                      static_cast<uint32_t>(Type), ValueSize, MaxInsns);
+  }
+  LoadPatchableConstant(Reg, Value, MaxInsns);
   Relocations.emplace_back(MoveABI);
 }
 

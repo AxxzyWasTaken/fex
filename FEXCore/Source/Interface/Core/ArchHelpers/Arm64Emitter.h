@@ -29,6 +29,7 @@ enum X86Reg : uint32_t;
 }
 
 namespace FEXCore::CPU {
+enum class RelocationTypes : uint32_t;
 // Contains the address to the currently available CPU state
 constexpr auto STATE = ARMEmitter::XReg::x28;
 
@@ -118,6 +119,10 @@ public:
     AUTOPAD,
   };
   void LoadConstant(ARMEmitter::Size s, ARMEmitter::Register Reg, uint64_t Constant, PadType Pad = PadType::NOPAD, int MaxBytes = 0);
+  void LoadPatchableConstant(ARMEmitter::Register Reg, uint64_t Value, uint8_t MaxInsns);
+  static bool CanLoadPatchableConstant(uint64_t Value, uint8_t MaxInsns);
+  static uint8_t GetPatchableMoveInsns(RelocationTypes Type, uint8_t ValueSize);
+  static uint64_t SignExtendPatchableData(uint64_t Value, uint8_t ValueSize);
 
 protected:
   FEXCore::Context::ContextImpl* EmitterCTX;
