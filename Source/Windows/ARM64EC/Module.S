@@ -22,7 +22,7 @@ check_target_ec:
   ldr x16, [x16, x17, lsl #3]
   lsr x17, x9, #12
   lsr x16, x16, x17
-  tbnz x16, #0, ExitFunctionEC
+  tbnz x16, #0, ExitFunctionSuspendResumePoint
   b enter_jit
 
   // __os_arm64x_dispatch_call_no_redirect in ARM64EC docs
@@ -66,8 +66,7 @@ ExitFunctionEC:
 1:
   ldr x17, [x18, #0x1788] // TEB->ChpeV2CpuAreaInfo
   strb wzr, [x17, #0x0] // ChpeV2CpuAreaInfo->InSimulation
-  ldr x17, [x17, #0x20] // ChpeV2CpuAreaInfo->SuspendDoorbell
-  ldr w17, [x17]
+  ldr w17, [x28, #0x530] // CpuStateFrame::SuspendDoorbell (verified by static_assert in Module.cpp)
   cbnz w17, ExitFunctionSuspendPoint
 
 .global ExitFunctionSuspendResumePoint

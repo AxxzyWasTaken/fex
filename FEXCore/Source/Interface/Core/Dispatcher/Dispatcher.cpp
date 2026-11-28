@@ -129,14 +129,21 @@ void Dispatcher::EmitDispatcher() {
 
   // As ARM64EC uses this as an entrypoint for both guest calls and host returns, opportunistically try to return
   // using the call-ret stack to avoid unbalancing it.
+  ARMEmitter::ForwardLabel LoopTopAfterECCheck;
+  ARMEmitter::ForwardLabel l_CallRetMiss;
   ldp<ARMEmitter::IndexType::OFFSET>(TMP1, TMP2, REG_CALLRET_SP);
   // EC_CALL_CHECKER_PC_REG is REG_PF which isn't touched by any of the above
   sub(ARMEmitter::Size::i64Bit, TMP1, EC_CALL_CHECKER_PC_REG, TMP1);
-  (void)cbnz(ARMEmitter::Size::i64Bit, TMP1, &LoopTop);
+  (void)cbnz(ARMEmitter::Size::i64Bit, TMP1, &l_CallRetMiss);
 
   // If the entry at the TOS is for the target address, pop it and return to the JIT code
   add(ARMEmitter::Size::i64Bit, REG_CALLRET_SP, REG_CALLRET_SP, 0x10);
   ret(TMP2);
+
+  (void)Bind(&l_CallRetMiss);
+  // Target PC was already verified non-EC by check_target_ec/ExitToX64 and stored to State.rip.
+  mov(RipReg, EC_CALL_CHECKER_PC_REG);
+  (void)b(&LoopTopAfterECCheck);
 
   // Enter JIT
 #endif
@@ -153,7 +160,6 @@ void Dispatcher::EmitDispatcher() {
 #ifdef ARCHITECTURE_arm64ec
   // Clobbers TMP1/2
   // Check the EC code bitmap incase we need to exit the JIT to call into native code.
-  ARMEmitter::ForwardLabel l_NotECCode;
   ldr(TMP1, ARMEmitter::XReg::x18, TEB_PEB_OFFSET);
   ldr(TMP1, TMP1, PEB_EC_CODE_BITMAP_OFFSET);
 
@@ -161,7 +167,7 @@ void Dispatcher::EmitDispatcher() {
   ldr(TMP1, TMP1, TMP2, ARMEmitter::ExtendedType::LSL_64, 3);
   lsr(ARMEmitter::Size::i64Bit, TMP2, RipReg, 12);
   lsrv(ARMEmitter::Size::i64Bit, TMP1, TMP1, TMP2);
-  (void)tbz(TMP1, 0, &l_NotECCode);
+  (void)tbz(TMP1, 0, &LoopTopAfterECCheck);
 
   str(REG_CALLRET_SP, STATE_PTR(CpuStateFrame, State.callret_sp));
 
@@ -170,7 +176,7 @@ void Dispatcher::EmitDispatcher() {
   ldr(TMP2, STATE_PTR(CpuStateFrame, Pointers.ExitFunctionEC));
   br(TMP2);
 
-  (void)Bind(&l_NotECCode);
+  (void)Bind(&LoopTopAfterECCheck);
 #endif
 
   ldrb(TMP1, STATE_PTR(CpuStateFrame, State.flags[X86State::RFLAG_TF_RAW_LOC]));

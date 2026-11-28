@@ -94,6 +94,17 @@ DEF_OP(ExitFunction) {
   if (IsInlineConstant(Op->NewRIP, &NewRIP) || IsInlineEntrypointOffset(Op->NewRIP, &NewRIP)) {
 #ifdef ARCHITECTURE_arm64ec
     if (NewRIP < EC_CODE_BITMAP_MAX_ADDRESS && RtlIsEcCode(NewRIP)) {
+      ARMEmitter::ForwardLabel l_CallReturn;
+      const bool PushCallRet = Op->Hint == IR::BranchHint::Call && !Op->CallReturnBlock.IsInvalid();
+      if (PushCallRet) {
+        // Push before saving REG_CALLRET_SP, switching sp to guest RSP, and writing EC_CALL_CHECKER_PC_REG
+        // (x9 can hold CallReturnAddressReg when SupportsAPFLG reclaims REG_PF). Only push when the return
+        // block is known because DispatcherLoopTopEnterEC does not pop on a miss.
+        auto CallReturnAddressReg = GetReg(Op->CallReturnAddress).X();
+        PendingCallReturnTargetLabel = &CallReturnTargets.try_emplace(Op->CallReturnBlock.ID()).first->second;
+        (void)adr(TMP1, &l_CallReturn);
+        stp<ARMEmitter::IndexType::PRE>(CallReturnAddressReg, TMP1, REG_CALLRET_SP, -0x10);
+      }
       str(REG_CALLRET_SP, STATE_PTR(CpuStateFrame, State.callret_sp));
       add(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::rsp, StaticRegisters[X86State::REG_RSP], 0);
       if (Op->PatchSiteAddress) {
@@ -104,6 +115,9 @@ DEF_OP(ExitFunction) {
       }
       ldr(TMP2, STATE_PTR(CpuStateFrame, Pointers.ExitFunctionEC));
       br(TMP2);
+      if (PushCallRet) {
+        (void)Bind(&l_CallReturn);
+      }
     } else {
 #endif
       // In order to support direct branches without constantly hitting the L1 cache, we emit a call to a block linker,

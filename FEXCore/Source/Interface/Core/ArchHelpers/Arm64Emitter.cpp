@@ -659,26 +659,42 @@ void Arm64Emitter::PopCalleeSavedRegisters() {
 void Arm64Emitter::FillSpecialRegs(ARMEmitter::Register TmpReg, ARMEmitter::Register TmpReg2, const FillSpecialRegsOptions& Options) {
 #ifndef VIXL_SIMULATOR
   if (Options.SetAFP && EmitterCTX->HostFeatures.SupportsAFP) {
-    // Enable AFP features when filling JIT state.
-    mrs(TmpReg, ARMEmitter::SystemRegister::FPCR);
+    LOGMAN_THROW_A_FMT(TmpReg != TmpReg2, "FillSpecialRegs requires distinct temporary registers");
 
-    // Enable FPCR.NEP and FPCR.AH
+    // Enable AFP features when filling JIT state.
     // NEP(2): Changes ASIMD scalar instructions to insert in to the lower bits of the destination.
     // AH(1):  Changes NaN behaviour in some instructions. Specifically fmin, fmax.
     //
     // Additional interesting AFP bits:
     // FIZ(0): Flush Inputs to Zero
-    orr(ARMEmitter::Size::i64Bit, TmpReg, TmpReg,
-        (1U << 2) |   // NEP
-          (1U << 1)); // AH
+    //
+    // Writing FPCR is expensive even when unchanged, so skip the msr if the target bits already match.
+    // NZCV may be live here, so avoid flag-setting instructions.
+    ARMEmitter::ForwardLabel SkipFPCR;
+    mrs(TmpReg, ARMEmitter::SystemRegister::FPCR);
 
     if (Options.SetFIZ) {
-      // Insert MXCSR.DAZ in to FIZ
+      // Insert MXCSR.DAZ in to FIZ while enabling NEP and AH.
+      // Diff = (OldFPCR ^ DesiredLow3Bits) & 7; OldFPCR ^ Diff updates only bits [2:0].
       ldr(TmpReg2.W(), STATE.R(), offsetof(FEXCore::Core::CPUState, mxcsr));
-      bfxil(ARMEmitter::Size::i64Bit, TmpReg, TmpReg2, 6, 1);
+      ubfx(ARMEmitter::Size::i64Bit, TmpReg2, TmpReg2, 6, 1);
+      orr(ARMEmitter::Size::i64Bit, TmpReg2, TmpReg2,
+          (1U << 2) |   // NEP
+            (1U << 1)); // AH
+      eor(ARMEmitter::Size::i64Bit, TmpReg2, TmpReg2, TmpReg);
+      and_(ARMEmitter::Size::i64Bit, TmpReg2, TmpReg2, 7);
+      (void)cbz(ARMEmitter::Size::i64Bit, TmpReg2, &SkipFPCR);
+      eor(ARMEmitter::Size::i64Bit, TmpReg, TmpReg, TmpReg2);
+      msr(ARMEmitter::SystemRegister::FPCR, TmpReg);
+    } else {
+      orr(ARMEmitter::Size::i64Bit, TmpReg2, TmpReg,
+          (1U << 2) |   // NEP
+            (1U << 1)); // AH
+      eor(ARMEmitter::Size::i64Bit, TmpReg, TmpReg, TmpReg2);
+      (void)cbz(ARMEmitter::Size::i64Bit, TmpReg, &SkipFPCR);
+      msr(ARMEmitter::SystemRegister::FPCR, TmpReg2);
     }
-
-    msr(ARMEmitter::SystemRegister::FPCR, TmpReg);
+    (void)Bind(&SkipFPCR);
   }
 #endif
 
@@ -712,12 +728,22 @@ void Arm64Emitter::SpillStaticRegs(ARMEmitter::Register TmpReg, SpillStaticRegOp
     //
     // Additional interesting AFP bits:
     // FIZ(0): Flush Inputs to Zero
+    //
+    // Writing FPCR is expensive even when unchanged; skip the msr if all three bits are already clear.
+    // NZCV is live here (spilled immediately below), so avoid flag-setting instructions.
+    ARMEmitter::ForwardLabel DoWriteFPCR;
+    ARMEmitter::ForwardLabel SkipFPCR;
     mrs(TmpReg, ARMEmitter::SystemRegister::FPCR);
+    (void)tbnz(TmpReg, 2, &DoWriteFPCR); // NEP
+    (void)tbnz(TmpReg, 1, &DoWriteFPCR); // AH
+    (void)tbz(TmpReg, 0, &SkipFPCR);     // FIZ
+    (void)Bind(&DoWriteFPCR);
     bic(ARMEmitter::Size::i64Bit, TmpReg, TmpReg,
         (1U << 2) |   // NEP
           (1U << 1) | // AH
           (1U << 0)); // FIZ
     msr(ARMEmitter::SystemRegister::FPCR, TmpReg);
+    (void)Bind(&SkipFPCR);
   }
 #endif
 

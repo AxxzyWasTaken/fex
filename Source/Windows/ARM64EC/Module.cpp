@@ -77,6 +77,8 @@ extern void* ExitFunctionSuspendResumePoint;
 extern uint64_t SyscallTable[];
 extern uint64_t SyscallTableEnd[];
 
+static_assert(offsetof(FEXCore::Core::CpuStateFrame, SuspendDoorbell) == 0x530, "Module.S ExitFunctionEC SuspendDoorbell offset mismatch");
+
 void* X64ReturnInstr; // See Module.S
 uintptr_t NtDllBase;
 
@@ -605,7 +607,9 @@ static ARM64_NT_CONTEXT StoreStateToPackedECContext(FEXCore::Core::InternalThrea
   ECContext.Cpsr |= (EFlags & (1U << FEXCore::X86State::RFLAG_ZF_RAW_LOC)) ? (1U << 30) : 0;
   ECContext.Cpsr |= (EFlags & (1U << FEXCore::X86State::RFLAG_SF_RAW_LOC)) ? (1U << 31) : 0;
 
-  ECContext.Fpcr = FPCR;
+  // Clear FEX's internal AFP bits (NEP/AH) so native ARM64EC handlers and exception
+  // dispatchers never observe FEX's modified scalar/NaN semantics.
+  ECContext.Fpcr = FPCR & ~6U;
   ECContext.Fpsr = FPSR;
 
   // TODO: These are super incorrect for debug registers.
